@@ -1,0 +1,70 @@
+/**
+ * EdgeOrchestrator inter-node protocol messages.
+ * Author: Dimitris Kafetzis
+ */
+
+syntax = "proto3";
+package edge_orchestrator;
+
+// ─────────────────────────────────────────────
+// Resource Advertisement (UDP broadcast)
+// ─────────────────────────────────────────────
+
+message NodeAdvertisement {
+    string node_id = 1;
+    string address = 2;         // IP address for TCP transport
+    uint32 tcp_port = 3;
+    ResourceSummary resources = 4;
+    uint64 timestamp_ms = 5;
+}
+
+message ResourceSummary {
+    float cpu_usage_percent = 1;
+    uint64 memory_available_bytes = 2;
+    uint64 memory_total_bytes = 3;
+    float temperature_celsius = 4;
+    bool is_throttled = 5;
+    uint64 network_rx_bytes_sec = 6;
+    uint64 network_tx_bytes_sec = 7;
+}
+
+// ─────────────────────────────────────────────
+// Task Offloading (TCP)
+// ─────────────────────────────────────────────
+
+message TaskProfileMsg {
+    uint64 compute_cost_us = 1;     // Expected execution time in microseconds
+    uint64 memory_bytes = 2;        // Working memory requirement
+    uint64 input_bytes = 3;         // Input data size
+    uint64 output_bytes = 4;        // Output data size
+}
+
+message OffloadRequest {
+    string request_id = 1;
+    string task_id = 2;
+    string task_name = 3;
+    TaskProfileMsg profile = 4;
+    bytes input_data = 5;           // Serialized input payload
+}
+
+message OffloadResponse {
+    string request_id = 1;
+    string task_id = 2;
+    bool success = 3;
+    bytes output_data = 4;          // Serialized output payload
+    uint64 actual_duration_us = 5;
+    uint64 peak_memory_bytes = 6;
+    string error_message = 7;       // Empty on success
+}
+
+// ─────────────────────────────────────────────
+// Message Envelope (multiplexing over TCP)
+// ─────────────────────────────────────────────
+
+message Envelope {
+    oneof payload {
+        NodeAdvertisement advertisement = 1;
+        OffloadRequest offload_request = 2;
+        OffloadResponse offload_response = 3;
+    }
+}

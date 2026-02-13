@@ -1,0 +1,86 @@
+name: CI
+
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+    branches: [main]
+
+jobs:
+  build-x86:
+    runs-on: ubuntu-24.04
+    strategy:
+      matrix:
+        build_type: [Debug, Release]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            protobuf-compiler \
+            libprotobuf-dev \
+            cmake \
+            g++-13
+
+      - name: Configure
+        run: |
+          cmake -B build \
+            -DCMAKE_BUILD_TYPE=${{ matrix.build_type }} \
+            -DCMAKE_CXX_COMPILER=g++-13 \
+            -DBUILD_TESTS=ON
+
+      - name: Build
+        run: cmake --build build -j$(nproc)
+
+      - name: Test
+        run: cd build && ctest --output-on-failure --timeout 120
+
+  build-arm64:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install cross-compiler
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            g++-13-aarch64-linux-gnu \
+            protobuf-compiler \
+            libprotobuf-dev
+
+      - name: Configure (cross-compile)
+        run: |
+          cmake -B build-arm \
+            -DCMAKE_TOOLCHAIN_FILE=cmake/toolchain-aarch64.cmake \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DBUILD_TESTS=OFF
+
+      - name: Build
+        run: cmake --build build-arm -j$(nproc)
+
+  sanitizers:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            protobuf-compiler \
+            libprotobuf-dev \
+            cmake \
+            g++-13
+
+      - name: Build with ASan + UBSan
+        run: |
+          cmake -B build-san \
+            -DCMAKE_CXX_COMPILER=g++-13 \
+            -DENABLE_SANITIZERS=ON \
+            -DBUILD_TESTS=ON
+          cmake --build build-san -j$(nproc)
+
+      - name: Test with sanitizers
+        run: cd build-san && ctest --output-on-failure --timeout 120

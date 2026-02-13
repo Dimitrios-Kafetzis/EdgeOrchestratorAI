@@ -1,0 +1,37 @@
+# EdgeOrchestrator Default Configuration
+# See docs/DESIGN.md for detailed parameter descriptions.
+
+[node]
+id = "node-01"
+port = 5201
+discovery_port = 5200
+
+[monitor]
+sampling_interval_ms = 500
+mock = false
+
+[executor]
+thread_count = 0                    # 0 = use hardware_concurrency()
+memory_pool_mb = 64
+
+[scheduler]
+policy = "greedy"                   # "greedy", "threshold", "optimizer"
+
+[scheduler.threshold]
+cpu_threshold_percent = 75.0
+memory_threshold_percent = 80.0
+
+[scheduler.optimizer]
+max_iterations = 100
+communication_weight = 0.3
+
+[network]
+heartbeat_interval_ms = 2000
+peer_timeout_ms = 6000
+max_message_size_bytes = 1048576    # 1 MB
+
+[telemetry]
+log_dir = "./logs"
+max_file_size_mb = 50
+rotate_count = 5
+log_level = "info"
