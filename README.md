@@ -1,6 +1,6 @@
 # EdgeOrchestrator
 
-[![CI](https://github.com/dimitris-kafetzis/EdgeOrchestrator/actions/workflows/ci.yml/badge.svg)](https://github.com/dimitris-kafetzis/EdgeOrchestrator/actions/workflows/ci.yml)
+[![CI](https://github.com/Dimitrios-Kafetzis/EdgeOrchestratorAI/actions/workflows/ci.yml/badge.svg)](https://github.com/Dimitrios-Kafetzis/EdgeOrchestratorAI/actions/workflows/ci.yml)
 [![C++20](https://img.shields.io/badge/C%2B%2B-20-blue.svg)](https://isocpp.org/std/the-standard)
 [![Tests](https://img.shields.io/badge/tests-160%20passing-brightgreen.svg)](#test-suite)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
