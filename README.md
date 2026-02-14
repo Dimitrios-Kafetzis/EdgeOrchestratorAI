@@ -12,31 +12,31 @@ EdgeOrchestrator is a lightweight daemon designed for clusters of Raspberry Pi (
 
 ```
                   ┌────────────────────────────────────────────────┐
-                  │          EdgeOrchestrator Daemon (per node)     │
+                  │          EdgeOrchestrator Daemon (per node)    │
                   │                                                │
                   │   ┌─────────────────────────────────────────┐  │
-                  │   │           Orchestrator Facade            │  │
-                  │   │  Lifecycle · Workload Submission · TCP   │  │
+                  │   │           Orchestrator Facade           │  │
+                  │   │  Lifecycle · Workload Submission · TCP  │  │
                   │   └────────┬──────────┬──────────┬──────────┘  │
-                  │            │          │          │              │
-                  │   ┌────────▼───┐ ┌────▼────┐ ┌──▼─────────┐   │
-                  │   │  Resource   │ │Scheduler│ │  Executor   │   │
-                  │   │  Monitor    │ │ 3 modes │ │ThreadPool + │   │
-                  │   │ /proc /sys  │ │         │ │ MemoryPool  │   │
-                  │   └────────┬───┘ └────┬────┘ └──┬─────────┘   │
-                  │            │          │          │              │
-                  │   ┌────────▼───┐ ┌────▼────┐ ┌──▼─────────┐   │
-                  │   │  Workload   │ │ Network │ │ Telemetry   │   │
-                  │   │  DAG Model  │ │Discovery│ │   NDJSON    │   │
-                  │   │ 5 topologies│ │TCP Xport│ │   events    │   │
-                  │   └────────────┘ └─────────┘ └────────────┘   │
+                  │            │          │          │             │
+                  │   ┌────────▼───┐ ┌────▼────┐ ┌───▼─────────┐   │
+                  │   │  Resource  │ │Scheduler│ │  Executor   │   │
+                  │   │  Monitor   │ │ 3 modes │ │ThreadPool + │   │
+                  │   │ /proc /sys │ │         │ │ MemoryPool  │   │
+                  │   └────────┬───┘ └────┬────┘ └───┬─────────┘   │
+                  │            │          │          │             │
+                  │   ┌────────▼────┐ ┌────▼────┐ ┌───▼─────────┐  │
+                  │   │  Workload   │ │ Network │ │ Telemetry   │  │
+                  │   │  DAG Model  │ │Discovery│ │   NDJSON    │  │
+                  │   │ 5 topologies│ │TCP Xport│ │   events    │  │
+                  │   └─────────────┘ └─────────┘ └─────────────┘  │
                   └────────────────────────────────────────────────┘
                             ▲                    ▲
                             │  UDP broadcast     │  TCP offload
                             ▼                    ▼
-                  ┌──────────────┐     ┌──────────────┐
-                  │  Peer Node B │     │  Peer Node C │
-                  └──────────────┘     └──────────────┘
+                  ┌──────────────┐            ┌──────────────┐
+                  │  Peer Node B │            │  Peer Node C │
+                  └──────────────┘            └──────────────┘
 ```
 
 ## Key Features
