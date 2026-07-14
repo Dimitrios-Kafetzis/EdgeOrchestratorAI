@@ -25,6 +25,7 @@ namespace edge_orchestrator {
 class ClusterViewManager {
 public:
     void update_peer(const NodeId& id, ResourceSnapshot snapshot);
+    void update_peer(const PeerInfo& info);
     void mark_unreachable(const NodeId& id);
     void remove_peer(const NodeId& id);
     void clear();
@@ -32,6 +33,7 @@ public:
     [[nodiscard]] ClusterView snapshot() const;
     [[nodiscard]] std::vector<NodeId> available_peers() const;
     [[nodiscard]] std::optional<ResourceSnapshot> peer_resources(const NodeId& id) const;
+    [[nodiscard]] std::optional<PeerInfo> peer_info(const NodeId& id) const;
     [[nodiscard]] size_t cluster_size() const noexcept;
     [[nodiscard]] bool has_peer(const NodeId& id) const;
 

@@ -70,6 +70,8 @@ Result<Config> load_config(const std::filesystem::path& path) {
                 network["heartbeat_interval_ms"].value_or(int64_t{2000}));
             config.network.peer_timeout_ms = static_cast<uint32_t>(
                 network["peer_timeout_ms"].value_or(int64_t{6000}));
+            config.network.offload_timeout_ms = static_cast<uint32_t>(
+                network["offload_timeout_ms"].value_or(int64_t{10000}));
             config.network.max_message_size_bytes = static_cast<uint64_t>(
                 network["max_message_size_bytes"].value_or(int64_t{1048576}));
         }

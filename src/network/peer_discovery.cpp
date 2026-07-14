@@ -315,6 +315,8 @@ PeerInfo PeerDiscovery::parse_advert(const AdvertPacket& pkt,
     PeerInfo peer;
     peer.node_id = std::string(pkt.node_id,
         strnlen(pkt.node_id, sizeof(pkt.node_id)));
+    peer.address = sender_addr;
+    peer.tcp_port = be16toh(pkt.tcp_port_be);
     peer.reachable = true;
 
     peer.resources.node_id = peer.node_id;
@@ -324,9 +326,6 @@ PeerInfo PeerDiscovery::parse_advert(const AdvertPacket& pkt,
     peer.resources.cpu_temperature_celsius = float_from_wire(pkt.temperature_bits_be);
     peer.resources.is_throttled = (be32toh(pkt.flags_be) & 1u) != 0;
     peer.resources.timestamp = std::chrono::system_clock::now();
-
-    // Store sender address (unused in PeerInfo but useful for transport layer)
-    (void)sender_addr;
 
     return peer;
 }

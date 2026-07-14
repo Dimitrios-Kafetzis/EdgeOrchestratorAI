@@ -53,6 +53,7 @@ struct OrchestrationResult {
     size_t offloaded_tasks = 0;
     size_t completed_tasks = 0;
     size_t failed_tasks = 0;
+    size_t offload_fallbacks = 0;   ///< Offloads that failed over to local execution
     Duration total_duration{0};
 };
 
@@ -125,9 +126,19 @@ public:
     MetricsCollector& metrics() { return metrics_; }
 
 private:
+    struct RemoteOutcome {
+        bool transport_ok = false;   ///< Round trip succeeded (peer reachable + response decoded)
+        bool task_ok = false;        ///< Peer reported successful execution
+        Duration duration{0};
+        std::string error;
+    };
+
     std::unique_ptr<ISchedulingPolicy> create_policy() const;
     void handle_offload_request(const std::vector<uint8_t>& request,
                                 std::vector<uint8_t>& response);
+    RemoteOutcome offload_to_peer(const TaskId& task_id,
+                                  const TaskProfile& profile,
+                                  const NodeId& target);
 
     Config config_;
     Logger logger_;
@@ -186,10 +197,12 @@ Result<void> Orchestrator<MonitorT>::start() {
     // Start monitor
     monitor_.start();
 
-    // Register discovery callbacks
+    // Register discovery callbacks. The full PeerInfo is stored so the
+    // offload client can resolve node id -> IP:port later.
     discovery_.on_peer_discovered([this](const PeerInfo& peer) {
-        cluster_mgr_.update_peer(peer.node_id, peer.resources);
-        logger_.info("Peer discovered: " + peer.node_id);
+        cluster_mgr_.update_peer(peer);
+        logger_.info("Peer discovered: " + peer.node_id
+                     + " at " + peer.address + ":" + std::to_string(peer.tcp_port));
         metrics_.record_peer_event(peer.node_id, "discovered");
     });
 
@@ -250,6 +263,7 @@ Result<OrchestrationResult> Orchestrator<MonitorT>::submit_workload(const Worklo
 
     std::atomic<size_t> completed{0};
     std::atomic<size_t> failed{0};
+    std::atomic<size_t> fallbacks{0};
     std::stop_source stop_source;
 
     for (const auto& decision : plan.decisions) {
@@ -276,14 +290,34 @@ Result<OrchestrationResult> Orchestrator<MonitorT>::submit_workload(const Worklo
             });
         } else {
             result.offloaded_tasks++;
-            thread_pool_.submit([this, &completed, &failed,
+            thread_pool_.submit([this, &completed, &failed, &fallbacks,
                                   profile = task->profile,
                                   task_id = decision.task_id,
                                   target = decision.assigned_node]() {
-                // In a full deployment, we'd resolve target → IP:port via discovery.
-                // For now, offloaded tasks execute locally with a log note.
-                logger_.debug("Offloading task " + task_id + " → " + target
-                              + " (local fallback in test)");
+                auto outcome = offload_to_peer(task_id, profile, target);
+
+                if (outcome.transport_ok) {
+                    metrics_.record_task_event(task_id,
+                        outcome.task_ok ? TaskState::Completed : TaskState::Failed,
+                        outcome.duration);
+                    if (outcome.task_ok) {
+                        completed.fetch_add(1);
+                    } else {
+                        logger_.warn("Peer " + target + " failed task " + task_id
+                                     + ": " + outcome.error);
+                        failed.fetch_add(1);
+                    }
+                    return;
+                }
+
+                // The peer was unreachable or the round trip broke: the task
+                // must not be lost, so it fails over to local execution.
+                logger_.warn("Offload of " + task_id + " to " + target
+                             + " failed (" + outcome.error + "); executing locally");
+                metrics_.record_custom("offload_fallback",
+                    "{\"task\":\"" + task_id + "\",\"target\":\"" + target + "\"}");
+                fallbacks.fetch_add(1);
+
                 auto exec_result = task_runner_.execute(task_id, profile,
                     memory_pool_, std::stop_token{});
                 metrics_.record_task_event(task_id, exec_result.final_state,
@@ -306,6 +340,7 @@ Result<OrchestrationResult> Orchestrator<MonitorT>::submit_workload(const Worklo
 
     result.completed_tasks = completed.load();
     result.failed_tasks = failed.load();
+    result.offload_fallbacks = fallbacks.load();
     result.total_duration = std::chrono::duration_cast<Duration>(
         std::chrono::steady_clock::now() - start_time);
 
@@ -328,6 +363,58 @@ std::unique_ptr<ISchedulingPolicy> Orchestrator<MonitorT>::create_policy() const
         return std::make_unique<OptimizerPolicy>(config_.scheduler.optimizer);
     }
     return std::make_unique<GreedyPolicy>();  // default
+}
+
+template <typename MonitorT>
+typename Orchestrator<MonitorT>::RemoteOutcome
+Orchestrator<MonitorT>::offload_to_peer(const TaskId& task_id,
+                                        const TaskProfile& profile,
+                                        const NodeId& target) {
+    RemoteOutcome outcome;
+
+    auto peer = cluster_mgr_.peer_info(target);
+    if (!peer || peer->address.empty() || peer->tcp_port == 0) {
+        outcome.error = "no known endpoint for " + target;
+        return outcome;
+    }
+
+    TcpTransport client;
+    auto conn = client.connect(peer->address, peer->tcp_port,
+                               config_.network.offload_timeout_ms);
+    if (!conn.has_value()) {
+        outcome.error = "connect: " + conn.error().message;
+        return outcome;
+    }
+
+    auto request = OffloadCodec::encode_request(task_id, profile);
+    auto sent = client.send(request);
+    if (!sent.has_value()) {
+        outcome.error = "send: " + sent.error().message;
+        return outcome;
+    }
+
+    auto reply = client.receive(config_.network.offload_timeout_ms);
+    if (!reply.has_value()) {
+        outcome.error = "receive: " + reply.error().message;
+        return outcome;
+    }
+
+    bool success = false;
+    Duration duration{0};
+    uint64_t peak_memory = 0;
+    std::string error_msg;
+    std::vector<uint8_t> output;
+    if (!OffloadCodec::decode_response(*reply, success, duration,
+                                       peak_memory, error_msg, output)) {
+        outcome.error = "malformed response";
+        return outcome;
+    }
+
+    outcome.transport_ok = true;
+    outcome.task_ok = success;
+    outcome.duration = duration;
+    outcome.error = error_msg;
+    return outcome;
 }
 
 template <typename MonitorT>

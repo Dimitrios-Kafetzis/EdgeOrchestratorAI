@@ -9,6 +9,7 @@
 #include "workload/generator.hpp"
 
 #include <gtest/gtest.h>
+#include <atomic>
 #include <chrono>
 #include <thread>
 
@@ -186,6 +187,117 @@ TEST(OffloadE2ETest, TcpOffloadWithCodec) {
 
     client.disconnect();
     server.stop_serving();
+}
+
+// The orchestrator itself resolves the peer endpoint from the cluster view,
+// connects, and round-trips the task — no test-side client involved.
+TEST(OffloadE2ETest, OrchestratorOffloadsToRealPeer) {
+    // Fake peer: decodes each request, "executes", responds, and counts.
+    TcpTransport peer_server;
+    uint16_t peer_port = 19961;
+    auto listen_result = peer_server.listen(peer_port);
+    if (!listen_result.has_value()) {
+        GTEST_SKIP() << "Could not bind to port " << peer_port;
+    }
+
+    std::atomic<size_t> remote_requests{0};
+    peer_server.serve([&remote_requests](const std::vector<uint8_t>& request) {
+        std::string task_id;
+        TaskProfile profile;
+        std::vector<uint8_t> input;
+        if (!OffloadCodec::decode_request(request, task_id, profile, input)) {
+            return OffloadCodec::encode_response(false, Duration{0}, 0, "decode failed");
+        }
+        remote_requests.fetch_add(1);
+        return OffloadCodec::encode_response(true, profile.compute_cost,
+                                             profile.memory_bytes);
+    });
+
+    auto config = default_config();
+    config.node.id = "offload-origin";
+    config.node.port = 19962;
+    config.executor.thread_count = 2;
+    config.executor.memory_pool_mb = 4;
+    config.scheduler.policy = "greedy";
+
+    Orchestrator<MockMonitor> orch({
+        .config = config,
+        .log_sink = std::make_unique<NullSink>(),
+        .log_level = LogLevel::Debug
+    });
+
+    // Local node is busy; the injected peer is idle, so greedy offloads.
+    orch.monitor().set_cpu(95.0f);
+    orch.monitor().set_memory(256ULL * 1024 * 1024, 4ULL * 1024 * 1024 * 1024);
+    ASSERT_TRUE(orch.start().has_value());
+
+    PeerInfo peer;
+    peer.node_id = "idle-peer";
+    peer.address = "127.0.0.1";
+    peer.tcp_port = peer_port;
+    peer.resources.node_id = "idle-peer";
+    peer.resources.cpu_usage_percent = 5.0f;
+    peer.resources.memory_available_bytes = 3ULL * 1024 * 1024 * 1024;
+    peer.resources.memory_total_bytes = 4ULL * 1024 * 1024 * 1024;
+    orch.cluster().update_peer(peer);
+
+    TaskProfile profile{.compute_cost = Duration{1000}, .memory_bytes = 4096};
+    auto dag = WorkloadGenerator::linear_chain(4, profile);
+    auto result = orch.submit_workload(dag);
+    ASSERT_TRUE(result.has_value());
+
+    EXPECT_GT(result->offloaded_tasks, 0u);
+    EXPECT_EQ(result->offload_fallbacks, 0u);
+    EXPECT_EQ(result->completed_tasks, dag.task_count());
+    EXPECT_EQ(result->failed_tasks, 0u);
+    EXPECT_EQ(remote_requests.load(), result->offloaded_tasks);
+
+    orch.stop();
+    peer_server.stop_serving();
+}
+
+// A peer that dies after being scheduled against must not lose tasks:
+// the offload fails over to local execution.
+TEST(OffloadE2ETest, OffloadFallsBackWhenPeerUnreachable) {
+    auto config = default_config();
+    config.node.id = "fallback-origin";
+    config.node.port = 19963;
+    config.executor.thread_count = 2;
+    config.executor.memory_pool_mb = 4;
+    config.scheduler.policy = "greedy";
+
+    Orchestrator<MockMonitor> orch({
+        .config = config,
+        .log_sink = std::make_unique<NullSink>(),
+        .log_level = LogLevel::Debug
+    });
+
+    orch.monitor().set_cpu(95.0f);
+    orch.monitor().set_memory(256ULL * 1024 * 1024, 4ULL * 1024 * 1024 * 1024);
+    ASSERT_TRUE(orch.start().has_value());
+
+    // Endpoint points at a closed port: connect gets an immediate refusal.
+    PeerInfo peer;
+    peer.node_id = "dead-peer";
+    peer.address = "127.0.0.1";
+    peer.tcp_port = 19964;
+    peer.resources.node_id = "dead-peer";
+    peer.resources.cpu_usage_percent = 5.0f;
+    peer.resources.memory_available_bytes = 3ULL * 1024 * 1024 * 1024;
+    peer.resources.memory_total_bytes = 4ULL * 1024 * 1024 * 1024;
+    orch.cluster().update_peer(peer);
+
+    TaskProfile profile{.compute_cost = Duration{1000}, .memory_bytes = 4096};
+    auto dag = WorkloadGenerator::linear_chain(4, profile);
+    auto result = orch.submit_workload(dag);
+    ASSERT_TRUE(result.has_value());
+
+    EXPECT_GT(result->offloaded_tasks, 0u);
+    EXPECT_EQ(result->offload_fallbacks, result->offloaded_tasks);
+    EXPECT_EQ(result->completed_tasks, dag.task_count());
+    EXPECT_EQ(result->failed_tasks, 0u);
+
+    orch.stop();
 }
 
 // ═══════════════════════════════════════════════

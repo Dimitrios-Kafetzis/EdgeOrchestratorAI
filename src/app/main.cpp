@@ -290,7 +290,7 @@ int main(int argc, char* argv[]) {
                             config.network.peer_timeout_ms);
 
     discovery.on_peer_discovered([&](const PeerInfo& peer) {
-        cluster_mgr.update_peer(peer.node_id, peer.resources);
+        cluster_mgr.update_peer(peer);
         logger.info("Peer discovered: " + peer.node_id
                     + " (CPU " + std::to_string(static_cast<int>(peer.resources.cpu_usage_percent))
                     + "%, mem " + std::to_string(peer.resources.memory_available_bytes / (1024*1024))

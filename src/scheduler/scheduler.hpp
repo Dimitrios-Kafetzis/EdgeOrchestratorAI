@@ -22,6 +22,8 @@ namespace edge_orchestrator {
 struct PeerInfo {
     NodeId node_id;
     ResourceSnapshot resources;
+    std::string address;       ///< IP address learned from discovery (empty if unknown)
+    uint16_t tcp_port = 0;     ///< Peer's offload TCP port (0 if unknown)
     bool reachable = true;
 };
 

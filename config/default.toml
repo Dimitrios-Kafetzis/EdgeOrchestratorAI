@@ -28,6 +28,7 @@ communication_weight = 0.3
 [network]
 heartbeat_interval_ms = 2000
 peer_timeout_ms = 6000
+offload_timeout_ms = 10000          # connect/receive deadline per offload
 max_message_size_bytes = 1048576    # 1 MB
 
 [telemetry]

@@ -12,7 +12,15 @@ namespace edge_orchestrator {
 
 void ClusterViewManager::update_peer(const NodeId& id, ResourceSnapshot snapshot) {
     std::unique_lock lock(mutex_);
-    peers_[id] = PeerInfo{.node_id = id, .resources = std::move(snapshot), .reachable = true};
+    auto& entry = peers_[id];  // preserves a previously learned endpoint
+    entry.node_id = id;
+    entry.resources = std::move(snapshot);
+    entry.reachable = true;
+}
+
+void ClusterViewManager::update_peer(const PeerInfo& info) {
+    std::unique_lock lock(mutex_);
+    peers_[info.node_id] = info;
 }
 
 void ClusterViewManager::mark_unreachable(const NodeId& id) {
@@ -59,6 +67,13 @@ std::optional<ResourceSnapshot> ClusterViewManager::peer_resources(const NodeId&
     auto it = peers_.find(id);
     if (it == peers_.end() || !it->second.reachable) return std::nullopt;
     return it->second.resources;
+}
+
+std::optional<PeerInfo> ClusterViewManager::peer_info(const NodeId& id) const {
+    std::shared_lock lock(mutex_);
+    auto it = peers_.find(id);
+    if (it == peers_.end() || !it->second.reachable) return std::nullopt;
+    return it->second;
 }
 
 size_t ClusterViewManager::cluster_size() const noexcept {

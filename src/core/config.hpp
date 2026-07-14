@@ -49,6 +49,7 @@ struct SchedulerConfig {
 struct NetworkConfig {
     uint32_t heartbeat_interval_ms = 2000;
     uint32_t peer_timeout_ms = 6000;
+    uint32_t offload_timeout_ms = 10000;   ///< Connect/receive deadline per offload
     uint64_t max_message_size_bytes = 1048576;
 };
 
