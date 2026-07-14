@@ -9,7 +9,9 @@ set(CMAKE_SYSTEM_PROCESSOR aarch64)
 set(CMAKE_C_COMPILER aarch64-linux-gnu-gcc)
 set(CMAKE_CXX_COMPILER aarch64-linux-gnu-g++)
 
-set(CMAKE_FIND_ROOT_PATH /usr/aarch64-linux-gnu)
+# /usr is included so Debian multiarch packages (e.g. libprotobuf-dev:arm64,
+# which installs under /usr/lib/aarch64-linux-gnu) are found for the target.
+set(CMAKE_FIND_ROOT_PATH /usr/aarch64-linux-gnu /usr)
 set(CMAKE_FIND_ROOT_PATH_MODE_PROGRAM NEVER)
 set(CMAKE_FIND_ROOT_PATH_MODE_LIBRARY ONLY)
 set(CMAKE_FIND_ROOT_PATH_MODE_INCLUDE ONLY)

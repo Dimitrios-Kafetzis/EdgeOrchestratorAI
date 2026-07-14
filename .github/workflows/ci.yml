@@ -42,13 +42,26 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install cross-compiler
+      - name: Install cross-compiler and arm64 libraries
         run: |
+          # The toolchain file expects the unversioned aarch64-linux-gnu-g++,
+          # and linking needs an aarch64 build of protobuf, which only exists
+          # on ports.ubuntu.com — hence the multiarch setup.
+          sudo dpkg --add-architecture arm64
+          sudo sed -i 's/^Signed-By:/Architectures: amd64\nSigned-By:/' /etc/apt/sources.list.d/ubuntu.sources
+          printf '%s\n' \
+            'Types: deb' \
+            'URIs: http://ports.ubuntu.com/ubuntu-ports' \
+            'Suites: noble noble-updates noble-security' \
+            'Components: main universe restricted multiverse' \
+            'Architectures: arm64' \
+            'Signed-By: /usr/share/keyrings/ubuntu-archive-keyring.gpg' \
+            | sudo tee /etc/apt/sources.list.d/ubuntu-ports-arm64.sources > /dev/null
           sudo apt-get update
           sudo apt-get install -y \
-            g++-13-aarch64-linux-gnu \
+            g++-aarch64-linux-gnu \
             protobuf-compiler \
-            libprotobuf-dev
+            libprotobuf-dev:arm64
 
       - name: Configure (cross-compile)
         run: |
