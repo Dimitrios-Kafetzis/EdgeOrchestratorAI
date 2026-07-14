@@ -53,20 +53,25 @@ public:
      * @brief Wire format for UDP advertisement packets.
      *
      * Fixed-size binary format avoids Protobuf dependency for the
-     * high-frequency discovery path. 64 bytes total.
+     * high-frequency discovery path. 72 bytes total.
+     *
+     * All multi-byte fields are big-endian on the wire (the _be suffix);
+     * floats travel as their IEEE-754 bit pattern in a uint32_t. Protocol
+     * version 2 introduced the fixed byte order — v1 peers sent host order
+     * and are rejected by the version check rather than misparsed.
      */
     struct __attribute__((packed)) AdvertPacket {
         char magic[4];             // "EORC"
-        uint8_t version;           // Protocol version (1)
+        uint8_t version;           // Protocol version (2)
         uint8_t reserved[3];
         char node_id[32];          // Null-padded node identifier
-        uint16_t tcp_port;         // Port for TCP transport
+        uint16_t tcp_port_be;      // Port for TCP transport
         uint16_t padding;
-        float cpu_usage_percent;
-        uint64_t memory_available_bytes;
-        uint64_t memory_total_bytes;
-        float temperature_celsius;
-        uint32_t flags;            // Bit 0: is_throttled
+        uint32_t cpu_usage_bits_be;        // IEEE-754 bits of cpu percent
+        uint64_t memory_available_be;
+        uint64_t memory_total_be;
+        uint32_t temperature_bits_be;      // IEEE-754 bits of degrees C
+        uint32_t flags_be;         // Bit 0: is_throttled
     };
 
     static_assert(sizeof(AdvertPacket) == 72, "AdvertPacket must be 72 bytes");

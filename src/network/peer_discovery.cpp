@@ -14,6 +14,7 @@
 #include <arpa/inet.h>
 #include <cerrno>
 #include <cstring>
+#include <endian.h>
 #include <netinet/in.h>
 #include <poll.h>
 #include <sys/socket.h>
@@ -24,7 +25,20 @@ namespace edge_orchestrator {
 namespace {
 
 constexpr char MAGIC[4] = {'E', 'O', 'R', 'C'};
-constexpr uint8_t PROTOCOL_VERSION = 1;
+constexpr uint8_t PROTOCOL_VERSION = 2;  // v2: fixed big-endian byte order
+
+uint32_t float_to_wire(float value) {
+    uint32_t bits;
+    std::memcpy(&bits, &value, sizeof(bits));
+    return htobe32(bits);
+}
+
+float float_from_wire(uint32_t wire) {
+    uint32_t bits = be32toh(wire);
+    float value;
+    std::memcpy(&value, &bits, sizeof(value));
+    return value;
+}
 
 /**
  * @brief Create a non-blocking UDP socket with SO_BROADCAST and SO_REUSEADDR.
@@ -281,16 +295,16 @@ PeerDiscovery::AdvertPacket PeerDiscovery::build_advert() const {
     auto copy_len = std::min(node_id_.size(), sizeof(pkt.node_id) - 1);
     std::memcpy(pkt.node_id, node_id_.data(), copy_len);
 
-    pkt.tcp_port = port_;
+    pkt.tcp_port_be = htobe16(port_);
 
     // Snapshot local resources
     {
         std::lock_guard lock(resource_mutex_);
-        pkt.cpu_usage_percent = local_resources_.cpu_usage_percent;
-        pkt.memory_available_bytes = local_resources_.memory_available_bytes;
-        pkt.memory_total_bytes = local_resources_.memory_total_bytes;
-        pkt.temperature_celsius = local_resources_.cpu_temperature_celsius;
-        pkt.flags = local_resources_.is_throttled ? 1u : 0u;
+        pkt.cpu_usage_bits_be = float_to_wire(local_resources_.cpu_usage_percent);
+        pkt.memory_available_be = htobe64(local_resources_.memory_available_bytes);
+        pkt.memory_total_be = htobe64(local_resources_.memory_total_bytes);
+        pkt.temperature_bits_be = float_to_wire(local_resources_.cpu_temperature_celsius);
+        pkt.flags_be = htobe32(local_resources_.is_throttled ? 1u : 0u);
     }
 
     return pkt;
@@ -304,11 +318,11 @@ PeerInfo PeerDiscovery::parse_advert(const AdvertPacket& pkt,
     peer.reachable = true;
 
     peer.resources.node_id = peer.node_id;
-    peer.resources.cpu_usage_percent = pkt.cpu_usage_percent;
-    peer.resources.memory_available_bytes = pkt.memory_available_bytes;
-    peer.resources.memory_total_bytes = pkt.memory_total_bytes;
-    peer.resources.cpu_temperature_celsius = pkt.temperature_celsius;
-    peer.resources.is_throttled = (pkt.flags & 1u) != 0;
+    peer.resources.cpu_usage_percent = float_from_wire(pkt.cpu_usage_bits_be);
+    peer.resources.memory_available_bytes = be64toh(pkt.memory_available_be);
+    peer.resources.memory_total_bytes = be64toh(pkt.memory_total_be);
+    peer.resources.cpu_temperature_celsius = float_from_wire(pkt.temperature_bits_be);
+    peer.resources.is_throttled = (be32toh(pkt.flags_be) & 1u) != 0;
     peer.resources.timestamp = std::chrono::system_clock::now();
 
     // Store sender address (unused in PeerInfo but useful for transport layer)

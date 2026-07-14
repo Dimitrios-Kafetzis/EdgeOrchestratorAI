@@ -369,6 +369,21 @@ TEST(PeerDiscoveryTest, AdvertPacketSize) {
     EXPECT_EQ(sizeof(PeerDiscovery::AdvertPacket), 72u);
 }
 
+// The field offsets are the wire contract: a change here breaks
+// compatibility with deployed nodes and must bump the protocol version.
+TEST(PeerDiscoveryTest, AdvertPacketLayout) {
+    using AP = PeerDiscovery::AdvertPacket;
+    EXPECT_EQ(offsetof(AP, magic), 0u);
+    EXPECT_EQ(offsetof(AP, version), 4u);
+    EXPECT_EQ(offsetof(AP, node_id), 8u);
+    EXPECT_EQ(offsetof(AP, tcp_port_be), 40u);
+    EXPECT_EQ(offsetof(AP, cpu_usage_bits_be), 44u);
+    EXPECT_EQ(offsetof(AP, memory_available_be), 48u);
+    EXPECT_EQ(offsetof(AP, memory_total_be), 56u);
+    EXPECT_EQ(offsetof(AP, temperature_bits_be), 64u);
+    EXPECT_EQ(offsetof(AP, flags_be), 68u);
+}
+
 TEST(PeerDiscoveryTest, UpdateLocalResources) {
     PeerDiscovery discovery("test-node", 15200, 1000, 3000);
 
