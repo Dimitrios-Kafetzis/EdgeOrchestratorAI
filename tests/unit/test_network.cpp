@@ -4,13 +4,20 @@
  * @author Dimitris Kafetzis
  */
 
+#include "network/async_transport.hpp"
 #include "network/cluster_view.hpp"
 #include "network/peer_discovery.hpp"
 #include "network/transport.hpp"
 
 #include <gtest/gtest.h>
+#include <atomic>
 #include <chrono>
 #include <thread>
+
+#include <arpa/inet.h>
+#include <netinet/in.h>
+#include <sys/socket.h>
+#include <unistd.h>
 
 using namespace edge_orchestrator;
 
@@ -353,6 +360,107 @@ TEST(TcpTransportTest, DisconnectThenReconnect) {
     EXPECT_TRUE(client.is_connected());
 
     client.disconnect();
+    server.stop_serving();
+}
+
+// ═══════════════════════════════════════════════
+// AsyncTransport Tests
+// ═══════════════════════════════════════════════
+
+TEST(AsyncTransportTest, EchoRoundTrip) {
+    AsyncTransport server;
+    uint16_t port = 19980;
+    auto listen_result = server.listen(port);
+    if (!listen_result.has_value()) {
+        GTEST_SKIP() << "Could not bind to port " << port;
+    }
+    server.serve([](const std::vector<uint8_t>& req) { return req; });
+
+    TcpTransport client;
+    ASSERT_TRUE(client.connect("127.0.0.1", port, 2000).has_value());
+    std::vector<uint8_t> payload{1, 2, 3, 4, 5};
+    ASSERT_TRUE(client.send(payload).has_value());
+    auto reply = client.receive(5000);
+    ASSERT_TRUE(reply.has_value());
+    EXPECT_EQ(*reply, payload);
+
+    client.disconnect();
+    server.stop_serving();
+}
+
+// The reason AsyncTransport exists: a slow request must not serialize
+// the others. Four requests against a 150 ms handler complete together,
+// not one after another.
+TEST(AsyncTransportTest, ConcurrentRequestsDoNotSerialize) {
+    AsyncTransport server(/*handler_threads=*/4);
+    uint16_t port = 19981;
+    auto listen_result = server.listen(port);
+    if (!listen_result.has_value()) {
+        GTEST_SKIP() << "Could not bind to port " << port;
+    }
+    server.serve([](const std::vector<uint8_t>& req) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(150));
+        return req;
+    });
+
+    auto start = std::chrono::steady_clock::now();
+
+    std::vector<std::jthread> clients;
+    std::atomic<int> ok{0};
+    for (uint8_t i = 0; i < 4; ++i) {
+        clients.emplace_back([port, i, &ok]() {
+            TcpTransport client;
+            if (!client.connect("127.0.0.1", port, 2000).has_value()) return;
+            std::vector<uint8_t> payload{i, i, i};
+            if (!client.send(payload).has_value()) return;
+            auto reply = client.receive(5000);
+            if (reply.has_value() && *reply == payload) ok.fetch_add(1);
+        });
+    }
+    clients.clear();  // join all
+
+    auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now() - start);
+
+    EXPECT_EQ(ok.load(), 4);
+    // Serialized handling would need >= 600 ms; allow generous CI slack.
+    EXPECT_LT(elapsed.count(), 450);
+
+    server.stop_serving();
+}
+
+TEST(AsyncTransportTest, OversizedFrameClosedWithoutResponse) {
+    AsyncTransport server;
+    uint16_t port = 19982;
+    auto listen_result = server.listen(port);
+    if (!listen_result.has_value()) {
+        GTEST_SKIP() << "Could not bind to port " << port;
+    }
+    std::atomic<bool> handler_ran{false};
+    server.serve([&handler_ran](const std::vector<uint8_t>& req) {
+        handler_ran = true;
+        return req;
+    });
+
+    // Hand-craft a frame claiming 64 MB — four times the cap.
+    int fd = ::socket(AF_INET, SOCK_STREAM, 0);
+    ASSERT_GE(fd, 0);
+    sockaddr_in addr{};
+    addr.sin_family = AF_INET;
+    addr.sin_port = htons(port);
+    ::inet_pton(AF_INET, "127.0.0.1", &addr.sin_addr);
+    ASSERT_EQ(::connect(fd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)), 0);
+
+    uint8_t evil_header[4] = {0x04, 0x00, 0x00, 0x00};  // 67108864 big-endian
+    ASSERT_EQ(::send(fd, evil_header, sizeof(evil_header), 0), 4);
+
+    // Server must close without replying, and the handler must never run.
+    uint8_t buf[16];
+    ssize_t n = ::recv(fd, buf, sizeof(buf), 0);
+    EXPECT_LE(n, 0);
+    EXPECT_FALSE(handler_ran.load());
+
+    ::close(fd);
     server.stop_serving();
 }
 

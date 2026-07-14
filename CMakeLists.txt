@@ -131,11 +131,13 @@ target_link_libraries(eo_executor PUBLIC eo_core)
 add_library(eo_network STATIC
     src/network/peer_discovery.cpp
     src/network/transport.cpp
+    src/network/async_transport.cpp
+    src/network/reactor.cpp
     src/network/cluster_view.cpp
     ${PROTO_SRCS}
 )
 target_include_directories(eo_network PUBLIC src ${CMAKE_CURRENT_BINARY_DIR})
-target_link_libraries(eo_network PUBLIC eo_core protobuf::libprotobuf)
+target_link_libraries(eo_network PUBLIC eo_core eo_executor protobuf::libprotobuf)
 
 # Telemetry
 add_library(eo_telemetry STATIC

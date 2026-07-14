@@ -21,6 +21,7 @@
 #include "executor/memory_pool.hpp"
 #include "executor/task_runner.hpp"
 #include "executor/thread_pool.hpp"
+#include "network/async_transport.hpp"
 #include "network/cluster_view.hpp"
 #include "network/peer_discovery.hpp"
 #include "network/transport.hpp"
@@ -192,10 +193,12 @@ private:
     TaskRunner task_runner_;
     std::shared_mutex arena_mutex_;
 
-    // Network
+    // Network. The server is async (epoll + coroutines) so a slow
+    // workload submission cannot block a peer's offload request; the
+    // offload client stays synchronous on executor worker threads.
     ClusterViewManager cluster_mgr_;
     PeerDiscovery discovery_;
-    TcpTransport offload_server_;
+    AsyncTransport offload_server_;
     std::jthread resource_thread_;   ///< Feeds monitor snapshots to discovery
 
     // Telemetry
