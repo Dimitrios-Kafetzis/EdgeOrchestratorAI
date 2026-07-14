@@ -59,11 +59,9 @@ struct OrchestrationResult {
 /**
  * @brief Serialized task request/response for TCP offloading.
  *
- * Simple binary format:
- *   Request:  [4B task_id_len][task_id][8B compute_cost_us][8B memory_bytes]
- *             [8B input_bytes][8B output_bytes][input_data...]
- *   Response: [1B status (0=ok,1=err)][8B duration_us][8B peak_mem]
- *             [4B error_len][error_msg][output_data...]
+ * Encodes/decodes edge_orchestrator.Envelope Protobuf messages
+ * (proto/protocol.proto). The payload travels inside a length-prefixed
+ * TcpTransport frame: [4B BE length][serialized Envelope].
  */
 struct OffloadCodec {
     static std::vector<uint8_t> encode_request(const std::string& task_id,
@@ -85,11 +83,6 @@ struct OffloadCodec {
                                 uint64_t& peak_memory,
                                 std::string& error_msg,
                                 std::vector<uint8_t>& output);
-
-    static void put_u64(std::vector<uint8_t>& buf, uint64_t val);
-    static void put_u32(std::vector<uint8_t>& buf, uint32_t val);
-    static uint64_t get_u64(const uint8_t* p);
-    static uint32_t get_u32(const uint8_t* p);
 };
 
 /**
