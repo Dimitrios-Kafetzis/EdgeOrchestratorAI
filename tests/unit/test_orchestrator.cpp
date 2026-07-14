@@ -13,6 +13,12 @@
 #include <chrono>
 #include <thread>
 
+#include <arpa/inet.h>
+#include <netinet/in.h>
+#include <poll.h>
+#include <sys/socket.h>
+#include <unistd.h>
+
 using namespace edge_orchestrator;
 
 // ═══════════════════════════════════════════════
@@ -379,6 +385,77 @@ TEST(WorkloadSubmissionTest, SubmitOverTcp) {
 
     client.disconnect();
     orch.stop();
+}
+
+// The DDIL case: a peer ACCEPTS the task (connection + request succeed)
+// and then dies before responding. The origin's receive times out or
+// errors, and the task must fail over to local execution, not vanish.
+TEST(OffloadE2ETest, OffloadFallsBackWhenPeerDiesMidTask) {
+    // Raw socket server: accept, read the request, close without replying.
+    int listen_fd = ::socket(AF_INET, SOCK_STREAM, 0);
+    ASSERT_GE(listen_fd, 0);
+    int optval = 1;
+    ::setsockopt(listen_fd, SOL_SOCKET, SO_REUSEADDR, &optval, sizeof(optval));
+    sockaddr_in addr{};
+    addr.sin_family = AF_INET;
+    addr.sin_port = htons(19967);
+    addr.sin_addr.s_addr = INADDR_ANY;
+    ASSERT_EQ(::bind(listen_fd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)), 0);
+    ASSERT_EQ(::listen(listen_fd, 4), 0);
+
+    std::jthread dying_peer([listen_fd](std::stop_token stop) {
+        while (!stop.stop_requested()) {
+            pollfd pfd{.fd = listen_fd, .events = POLLIN, .revents = 0};
+            if (::poll(&pfd, 1, 100) <= 0) continue;
+            int client = ::accept(listen_fd, nullptr, nullptr);
+            if (client < 0) continue;
+            uint8_t buf[512];
+            (void)::recv(client, buf, sizeof(buf), 0);  // "accept" the task...
+            ::close(client);                            // ...then die.
+        }
+    });
+
+    auto config = default_config();
+    config.node.id = "midtask-origin";
+    config.node.port = 19968;
+    config.executor.thread_count = 2;
+    config.executor.memory_pool_mb = 4;
+    config.scheduler.policy = "greedy";
+    config.network.offload_timeout_ms = 1000;  // keep the test fast
+
+    Orchestrator<MockMonitor> orch({
+        .config = config,
+        .log_sink = std::make_unique<NullSink>(),
+        .log_level = LogLevel::Debug
+    });
+    orch.monitor().set_cpu(95.0f);
+    orch.monitor().set_memory(256ULL * 1024 * 1024, 4ULL * 1024 * 1024 * 1024);
+    ASSERT_TRUE(orch.start().has_value());
+
+    PeerInfo peer;
+    peer.node_id = "dying-peer";
+    peer.address = "127.0.0.1";
+    peer.tcp_port = 19967;
+    peer.resources.node_id = "dying-peer";
+    peer.resources.cpu_usage_percent = 5.0f;
+    peer.resources.memory_available_bytes = 3ULL * 1024 * 1024 * 1024;
+    peer.resources.memory_total_bytes = 4ULL * 1024 * 1024 * 1024;
+    orch.cluster().update_peer(peer);
+
+    TaskProfile profile{.compute_cost = Duration{1000}, .memory_bytes = 4096};
+    auto dag = WorkloadGenerator::linear_chain(3, profile);
+    auto result = orch.submit_workload(dag);
+    ASSERT_TRUE(result.has_value());
+
+    EXPECT_GT(result->offloaded_tasks, 0u);
+    EXPECT_EQ(result->offload_fallbacks, result->offloaded_tasks);
+    EXPECT_EQ(result->completed_tasks, dag.task_count());
+    EXPECT_EQ(result->failed_tasks, 0u);
+
+    orch.stop();
+    dying_peer.request_stop();
+    dying_peer.join();
+    ::close(listen_fd);
 }
 
 // Regression: the arena is wholesale-reset at workload boundaries. Without
