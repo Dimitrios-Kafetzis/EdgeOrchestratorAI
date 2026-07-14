@@ -19,21 +19,22 @@ struct TaskProfile {
 
 struct ResourceSnapshot {
     NodeId    node_id;
+    Timestamp timestamp;
     float     cpu_usage_percent          = 0.0f;
+    std::array<float, 4> per_core_cpu_percent{};
     uint64_t  memory_available_bytes     = 0;
     uint64_t  memory_total_bytes         = 0;
     float     cpu_temperature_celsius    = 0.0f;
     float     gpu_temperature_celsius    = 0.0f;
+    uint64_t  network_rx_bytes_sec       = 0;
+    uint64_t  network_tx_bytes_sec       = 0;
     bool      is_throttled               = false;
-    uint64_t  network_rx_bytes_per_sec   = 0;
-    uint64_t  network_tx_bytes_per_sec   = 0;
-    Timestamp timestamp;
 
-    float memory_usage_percent() const noexcept;
-    float cpu_headroom() const noexcept;         // 100.0 - cpu_usage
+    constexpr float memory_usage_percent() const noexcept;
+    constexpr float cpu_headroom_percent() const noexcept;  // 100.0 - cpu_usage
 };
 
-enum class TaskState { Pending, Ready, Running, Completed, Failed };
+enum class TaskState : uint8_t { Pending, Ready, Scheduled, Running, Completed, Failed };
 ```
 
 ## Result Monad (`core/result.hpp`)
@@ -59,16 +60,25 @@ template <> class Result<void, Error>;
 ```cpp
 template <typename T>
 concept ResourceMonitorLike = requires(T monitor) {
-    { monitor.start() };
-    { monitor.stop() };
-    { monitor.read() } -> /* returns optional<ResourceSnapshot> */;
+    { monitor.read() } -> std::same_as<Result<ResourceSnapshot>>;
+    { monitor.cpu_usage() } -> std::convertible_to<float>;
+    { monitor.memory_available() } -> std::convertible_to<uint64_t>;
+    { monitor.is_throttled() } -> std::convertible_to<bool>;
+    { monitor.start() } -> std::same_as<void>;
+    { monitor.stop() } -> std::same_as<void>;
 };
 
 template <typename T>
-concept SchedulingPolicyLike = requires(T policy, WorkloadDAG& dag, ResourceSnapshot& snap, ClusterView& view) {
-    { policy.schedule(dag, snap, view) } -> std::same_as<SchedulingPlan>;
+concept SchedulingPolicyLike = requires(T policy,
+                                        const WorkloadDAG& dag,
+                                        const ResourceSnapshot& local,
+                                        const ClusterView& cluster) {
+    { policy.schedule(dag, local, cluster) } -> std::same_as<SchedulingPlan>;
     { policy.name() } -> std::convertible_to<std::string_view>;
 };
+
+// Enforced in tests: static_assert(SchedulingPolicyLike<GreedyPolicy>) etc.,
+// and Orchestrator static_asserts ResourceMonitorLike<MonitorT>.
 ```
 
 ## Resource Monitor (`resource_monitor/monitor.hpp`)
@@ -78,7 +88,7 @@ class LinuxMonitor {    // Satisfies ResourceMonitorLike
     LinuxMonitor(NodeId node_id, uint32_t sampling_interval_ms = 500);
     void start();
     void stop();
-    std::optional<ResourceSnapshot> read() const;
+    Result<ResourceSnapshot> read();
 
     void on_cpu_threshold(float percent, ThresholdCallback cb);
     void on_memory_threshold(float percent, ThresholdCallback cb);
@@ -88,7 +98,7 @@ class MockMonitor {     // Satisfies ResourceMonitorLike
     MockMonitor(NodeId node_id, uint32_t sampling_interval_ms = 0);
     void start();
     void stop();
-    std::optional<ResourceSnapshot> read() const;
+    Result<ResourceSnapshot> read();
 
     void set_cpu(float percent);
     void set_memory(uint64_t available, uint64_t total);
@@ -122,8 +132,11 @@ struct WorkloadGenerator {
     static WorkloadDAG linear_chain(size_t length, TaskProfile profile);
     static WorkloadDAG fan_out_fan_in(size_t fan_width, TaskProfile profile);
     static WorkloadDAG diamond(size_t depth, size_t width, TaskProfile profile);
-    static WorkloadDAG transformer_layers(size_t num_layers, size_t hidden_dim, size_t seq_len);
-    static WorkloadDAG random_dag(size_t num_tasks, float edge_probability, uint32_t seed = 42);
+    static WorkloadDAG transformer_layers(size_t num_layers, uint64_t hidden_dim,
+                                          uint64_t kv_cache_bytes_per_layer);
+    static WorkloadDAG random_dag(size_t num_tasks, float edge_probability,
+                                  TaskProfile min_profile, TaskProfile max_profile,
+                                  std::mt19937& rng);
 };
 ```
 
@@ -133,7 +146,8 @@ struct WorkloadGenerator {
 struct SchedulingDecision {
     TaskId task_id;
     NodeId assigned_node;
-    enum class Reason { Local, LeastLoaded, Offloaded, Fallback };
+    enum class Reason : uint8_t { LocalCapacity, LeastLoaded, ThresholdOffload,
+                                  OptimizationResult, Fallback };
     Reason reason;
 };
 
@@ -158,18 +172,26 @@ class OptimizerPolicy : public ISchedulingPolicy { OptimizerPolicy(OptimizerPoli
 
 ```cpp
 class ThreadPool {
-    ThreadPool(size_t num_threads);
-    void submit(std::function<void()> task);
-    size_t thread_count() const;
+    explicit ThreadPool(size_t num_threads = 0);   // 0 = hardware_concurrency
+
+    template <std::invocable F>
+    std::future<std::invoke_result_t<F>> submit(F&& func);
+
+    template <std::invocable<std::stop_token> F>
+    std::future<std::invoke_result_t<F, std::stop_token>> submit_cancellable(F&& func);
+
+    size_t active_count() const noexcept;
+    size_t queued_count() const noexcept;
+    size_t thread_count() const noexcept;
 };
 
 class MemoryPool {
-    MemoryPool(size_t capacity_bytes);
-    std::optional<size_t> allocate(size_t bytes);
-    void reset();
-    bool can_allocate(size_t bytes) const;
-    size_t capacity() const;
-    size_t used() const;
+    explicit MemoryPool(size_t capacity_bytes);
+    void* allocate(size_t size, size_t alignment = alignof(std::max_align_t));  // nullptr on exhaustion
+    void reset() noexcept;                  // wholesale arena reset
+    bool can_allocate(size_t size) const noexcept;
+    size_t capacity() const noexcept;
+    size_t used() const noexcept;
 };
 
 class TaskRunner {

@@ -208,15 +208,15 @@ See [`config/default.toml`](config/default.toml) for all options. Key settings:
 
 ```toml
 [node]
-id = "rpi-01"
-port = 5200
+id = "node-01"
+port = 5201
 
 [scheduler]
-policy = "optimizer"           # "greedy" | "threshold" | "optimizer"
+policy = "greedy"              # "greedy" | "threshold" | "optimizer"
 
 [scheduler.threshold]
-cpu_threshold_percent = 80.0
-memory_threshold_percent = 85.0
+cpu_threshold_percent = 75.0
+memory_threshold_percent = 80.0
 
 [scheduler.optimizer]
 max_iterations = 100
@@ -226,8 +226,8 @@ communication_weight = 0.3
 sampling_interval_ms = 500
 
 [network]
-heartbeat_interval_ms = 1000
-peer_timeout_ms = 5000
+heartbeat_interval_ms = 2000
+peer_timeout_ms = 6000
 
 [executor]
 thread_count = 0               # 0 = auto-detect hardware concurrency
