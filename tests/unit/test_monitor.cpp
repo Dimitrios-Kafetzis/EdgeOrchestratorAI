@@ -4,12 +4,17 @@
  * @author Dimitris Kafetzis
  */
 
+#include "core/concepts.hpp"
 #include "resource_monitor/monitor.hpp"
 
 #include <gtest/gtest.h>
 #include <chrono>
 
 using namespace edge_orchestrator;
+
+// Both monitors must satisfy the concept the Orchestrator relies on.
+static_assert(ResourceMonitorLike<LinuxMonitor>);
+static_assert(ResourceMonitorLike<MockMonitor>);
 
 // ─── MockMonitor ─────────────────────────────
 

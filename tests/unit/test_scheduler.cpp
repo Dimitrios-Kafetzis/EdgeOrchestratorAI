@@ -5,6 +5,7 @@
  */
 
 #include "core/config.hpp"
+#include "core/concepts.hpp"
 #include "scheduler/greedy_policy.hpp"
 #include "scheduler/threshold_policy.hpp"
 #include "scheduler/optimizer_policy.hpp"
@@ -13,6 +14,14 @@
 #include <gtest/gtest.h>
 #include <algorithm>
 #include <unordered_set>
+
+namespace {
+// Every policy must satisfy the concept, or it is decorative.
+using edge_orchestrator::SchedulingPolicyLike;
+static_assert(SchedulingPolicyLike<edge_orchestrator::GreedyPolicy>);
+static_assert(SchedulingPolicyLike<edge_orchestrator::ThresholdPolicy>);
+static_assert(SchedulingPolicyLike<edge_orchestrator::OptimizerPolicy>);
+}  // namespace
 
 using namespace edge_orchestrator;
 

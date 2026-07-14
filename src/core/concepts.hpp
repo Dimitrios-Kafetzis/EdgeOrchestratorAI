@@ -63,7 +63,7 @@ concept SchedulingPolicyLike = requires(
     const ClusterView& cluster
 ) {
     { policy.schedule(dag, local, cluster) } -> std::same_as<SchedulingPlan>;
-    { T::name() } -> std::convertible_to<std::string_view>;
+    { policy.name() } -> std::convertible_to<std::string_view>;
 };
 
 // ─────────────────────────────────────────────

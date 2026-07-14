@@ -13,6 +13,7 @@
 
 #pragma once
 
+#include "core/concepts.hpp"
 #include "core/config.hpp"
 #include "core/logger.hpp"
 #include "core/result.hpp"
@@ -98,6 +99,9 @@ struct OffloadCodec {
  */
 template <typename MonitorT = LinuxMonitor>
 class Orchestrator {
+    static_assert(ResourceMonitorLike<MonitorT>,
+                  "MonitorT must satisfy ResourceMonitorLike");
+
 public:
     struct Options {
         Config config;
