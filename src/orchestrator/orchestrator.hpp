@@ -38,6 +38,7 @@
 #include <functional>
 #include <memory>
 #include <mutex>
+#include <shared_mutex>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -63,8 +64,22 @@ struct OrchestrationResult {
  * Encodes/decodes edge_orchestrator.Envelope Protobuf messages
  * (proto/protocol.proto). The payload travels inside a length-prefixed
  * TcpTransport frame: [4B BE length][serialized Envelope].
+ *
+ * Protobuf stays quarantined inside offload_codec.cpp: no generated
+ * header leaks into module interfaces.
  */
 struct OffloadCodec {
+    /// Which Envelope payload a frame carries (server-side dispatch).
+    enum class WireKind : uint8_t {
+        Unknown,
+        OffloadRequest,
+        OffloadResponse,
+        WorkloadSubmission,
+        WorkloadResult
+    };
+
+    static WireKind classify(const std::vector<uint8_t>& data);
+
     static std::vector<uint8_t> encode_request(const std::string& task_id,
                                                 const TaskProfile& profile,
                                                 const std::vector<uint8_t>& input_data = {});
@@ -84,6 +99,22 @@ struct OffloadCodec {
                                 uint64_t& peak_memory,
                                 std::string& error_msg,
                                 std::vector<uint8_t>& output);
+
+    static std::vector<uint8_t> encode_submission(const std::string& workload_id,
+                                                   const WorkloadDAG& dag);
+    static bool decode_submission(const std::vector<uint8_t>& data,
+                                  std::string& workload_id,
+                                  WorkloadDAG& dag);
+
+    static std::vector<uint8_t> encode_workload_result(const std::string& workload_id,
+                                                        bool accepted,
+                                                        const std::string& error_msg,
+                                                        const OrchestrationResult& result);
+    static bool decode_workload_result(const std::vector<uint8_t>& data,
+                                       std::string& workload_id,
+                                       bool& accepted,
+                                       std::string& error_msg,
+                                       OrchestrationResult& result);
 };
 
 /**
@@ -134,25 +165,38 @@ private:
     };
 
     std::unique_ptr<ISchedulingPolicy> create_policy() const;
+    void handle_message(const std::vector<uint8_t>& request,
+                        std::vector<uint8_t>& response);
     void handle_offload_request(const std::vector<uint8_t>& request,
                                 std::vector<uint8_t>& response);
+    void handle_workload_submission(const std::vector<uint8_t>& request,
+                                    std::vector<uint8_t>& response);
     RemoteOutcome offload_to_peer(const TaskId& task_id,
                                   const TaskProfile& profile,
                                   const NodeId& target);
+    void resource_update_loop(std::stop_token stop);
+    ExecutionResult run_task(const TaskId& task_id,
+                             const TaskProfile& profile,
+                             std::stop_token stop);
+    void try_reset_arena();
 
     Config config_;
     Logger logger_;
     MonitorT monitor_;
 
-    // Executor
+    // Executor. Tasks execute under a shared lock on arena_mutex_; the
+    // arena resets only under the exclusive lock, so a reset can never
+    // invalidate memory a running task still holds.
     ThreadPool thread_pool_;
     MemoryPool memory_pool_;
     TaskRunner task_runner_;
+    std::shared_mutex arena_mutex_;
 
     // Network
     ClusterViewManager cluster_mgr_;
     PeerDiscovery discovery_;
     TcpTransport offload_server_;
+    std::jthread resource_thread_;   ///< Feeds monitor snapshots to discovery
 
     // Telemetry
     MetricsCollector metrics_;
@@ -212,12 +256,12 @@ Result<void> Orchestrator<MonitorT>::start() {
         metrics_.record_peer_event(peer.node_id, "lost");
     });
 
-    // Start offload server
+    // Start offload server — dispatches on the Envelope payload type
     auto listen_result = offload_server_.listen(config_.node.port);
     if (listen_result.has_value()) {
         offload_server_.serve([this](const std::vector<uint8_t>& request) -> std::vector<uint8_t> {
             std::vector<uint8_t> response;
-            handle_offload_request(request, response);
+            handle_message(request, response);
             return response;
         });
         logger_.info("Offload server listening on port " + std::to_string(config_.node.port));
@@ -228,6 +272,11 @@ Result<void> Orchestrator<MonitorT>::start() {
     // Start discovery
     discovery_.start();
 
+    // Keep the advertised resource picture fresh
+    resource_thread_ = std::jthread([this](std::stop_token stop) {
+        resource_update_loop(stop);
+    });
+
     logger_.info("Orchestrator started successfully");
     return Result<void>{};
 }
@@ -237,6 +286,10 @@ void Orchestrator<MonitorT>::stop() {
     if (!running_.exchange(false)) return;
 
     logger_.info("Orchestrator shutting down...");
+    if (resource_thread_.joinable()) {
+        resource_thread_.request_stop();
+        resource_thread_.join();
+    }
     discovery_.stop();
     offload_server_.stop_serving();
     monitor_.stop();
@@ -278,8 +331,7 @@ Result<OrchestrationResult> Orchestrator<MonitorT>::submit_workload(const Worklo
                                   profile = task->profile,
                                   task_id = decision.task_id,
                                   token = stop_source.get_token()]() {
-                auto exec_result = task_runner_.execute(task_id, profile,
-                                                        memory_pool_, token);
+                auto exec_result = run_task(task_id, profile, token);
                 metrics_.record_task_event(task_id, exec_result.final_state,
                                            exec_result.actual_duration);
                 if (exec_result.final_state == TaskState::Completed) {
@@ -318,8 +370,7 @@ Result<OrchestrationResult> Orchestrator<MonitorT>::submit_workload(const Worklo
                     "{\"task\":\"" + task_id + "\",\"target\":\"" + target + "\"}");
                 fallbacks.fetch_add(1);
 
-                auto exec_result = task_runner_.execute(task_id, profile,
-                    memory_pool_, std::stop_token{});
+                auto exec_result = run_task(task_id, profile, std::stop_token{});
                 metrics_.record_task_event(task_id, exec_result.final_state,
                                            exec_result.actual_duration);
                 if (exec_result.final_state == TaskState::Completed) {
@@ -341,6 +392,9 @@ Result<OrchestrationResult> Orchestrator<MonitorT>::submit_workload(const Worklo
     result.completed_tasks = completed.load();
     result.failed_tasks = failed.load();
     result.offload_fallbacks = fallbacks.load();
+
+    // This workload's arena allocations are dead once its tasks are done.
+    try_reset_arena();
     result.total_duration = std::chrono::duration_cast<Duration>(
         std::chrono::steady_clock::now() - start_time);
 
@@ -418,6 +472,90 @@ Orchestrator<MonitorT>::offload_to_peer(const TaskId& task_id,
 }
 
 template <typename MonitorT>
+ExecutionResult Orchestrator<MonitorT>::run_task(const TaskId& task_id,
+                                                 const TaskProfile& profile,
+                                                 std::stop_token stop) {
+    std::shared_lock guard(arena_mutex_);
+    return task_runner_.execute(task_id, profile, memory_pool_, std::move(stop));
+}
+
+template <typename MonitorT>
+void Orchestrator<MonitorT>::try_reset_arena() {
+    // The arena only frees wholesale. Reset opportunistically at task/
+    // workload boundaries: the exclusive lock guarantees quiescence, and
+    // try_to_lock means a busy executor just defers to the next boundary.
+    std::unique_lock guard(arena_mutex_, std::try_to_lock);
+    if (guard.owns_lock()) {
+        memory_pool_.reset();
+    }
+}
+
+template <typename MonitorT>
+void Orchestrator<MonitorT>::resource_update_loop(std::stop_token stop) {
+    const auto interval = std::chrono::milliseconds(
+        config_.monitor.sampling_interval_ms == 0 ? 500
+                                                  : config_.monitor.sampling_interval_ms);
+    while (!stop.stop_requested()) {
+        auto snap = monitor_.read();
+        if (snap.has_value()) {
+            discovery_.update_local_resources(*snap);
+        }
+
+        auto deadline = std::chrono::steady_clock::now() + interval;
+        while (!stop.stop_requested() && std::chrono::steady_clock::now() < deadline) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(50));
+        }
+    }
+}
+
+template <typename MonitorT>
+void Orchestrator<MonitorT>::handle_message(
+    const std::vector<uint8_t>& request,
+    std::vector<uint8_t>& response) {
+
+    switch (OffloadCodec::classify(request)) {
+        case OffloadCodec::WireKind::OffloadRequest:
+            handle_offload_request(request, response);
+            break;
+        case OffloadCodec::WireKind::WorkloadSubmission:
+            handle_workload_submission(request, response);
+            break;
+        default:
+            logger_.warn("Received unsupported message ("
+                         + std::to_string(request.size()) + " bytes)");
+            response = OffloadCodec::encode_response(false, Duration{0}, 0,
+                                                      "Unsupported message type");
+            break;
+    }
+}
+
+template <typename MonitorT>
+void Orchestrator<MonitorT>::handle_workload_submission(
+    const std::vector<uint8_t>& request,
+    std::vector<uint8_t>& response) {
+
+    std::string workload_id;
+    WorkloadDAG dag;
+    if (!OffloadCodec::decode_submission(request, workload_id, dag)) {
+        response = OffloadCodec::encode_workload_result(
+            workload_id, false, "Invalid workload submission", {});
+        return;
+    }
+
+    logger_.info("Workload '" + workload_id + "' received ("
+                 + std::to_string(dag.task_count()) + " tasks)");
+
+    auto result = submit_workload(dag);
+    if (!result.has_value()) {
+        response = OffloadCodec::encode_workload_result(
+            workload_id, false, result.error().message, {});
+        return;
+    }
+
+    response = OffloadCodec::encode_workload_result(workload_id, true, "", *result);
+}
+
+template <typename MonitorT>
 void Orchestrator<MonitorT>::handle_offload_request(
     const std::vector<uint8_t>& request,
     std::vector<uint8_t>& response) {
@@ -434,8 +572,7 @@ void Orchestrator<MonitorT>::handle_offload_request(
 
     logger_.debug("Executing offloaded task: " + task_id);
 
-    auto exec_result = task_runner_.execute(task_id, profile,
-                                             memory_pool_, std::stop_token{});
+    auto exec_result = run_task(task_id, profile, std::stop_token{});
 
     bool success = (exec_result.final_state == TaskState::Completed);
     std::string err = exec_result.error_message.value_or("");
@@ -445,6 +582,7 @@ void Orchestrator<MonitorT>::handle_offload_request(
 
     metrics_.record_task_event(task_id, exec_result.final_state,
                                 exec_result.actual_duration);
+    try_reset_arena();
 }
 
 }  // namespace edge_orchestrator

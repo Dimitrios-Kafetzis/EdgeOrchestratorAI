@@ -58,6 +58,35 @@ message OffloadResponse {
 }
 
 // ─────────────────────────────────────────────
+// Workload Submission (TCP)
+// ─────────────────────────────────────────────
+
+message TaskSpec {
+    string task_id = 1;
+    string name = 2;
+    TaskProfileMsg profile = 3;
+    repeated string dependencies = 4;   // task_ids that must complete first
+}
+
+message WorkloadSubmission {
+    string workload_id = 1;
+    repeated TaskSpec tasks = 2;
+}
+
+message WorkloadResult {
+    string workload_id = 1;
+    bool accepted = 2;
+    string error_message = 3;           // Empty when accepted
+    uint64 local_tasks = 4;
+    uint64 offloaded_tasks = 5;
+    uint64 completed_tasks = 6;
+    uint64 failed_tasks = 7;
+    uint64 offload_fallbacks = 8;
+    uint64 makespan_estimate_us = 9;
+    uint64 total_duration_us = 10;
+}
+
+// ─────────────────────────────────────────────
 // Message Envelope (multiplexing over TCP)
 // ─────────────────────────────────────────────
 
@@ -66,5 +95,7 @@ message Envelope {
         NodeAdvertisement advertisement = 1;
         OffloadRequest offload_request = 2;
         OffloadResponse offload_response = 3;
+        WorkloadSubmission workload_submission = 4;
+        WorkloadResult workload_result = 5;
     }
 }

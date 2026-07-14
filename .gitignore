@@ -29,3 +29,7 @@ logs/
 # OS
 .DS_Store
 Thumbs.db
+
+# Generated Python protobuf bindings
+tools/protocol_pb2.py
+tools/__pycache__/

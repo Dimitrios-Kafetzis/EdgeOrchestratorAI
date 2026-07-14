@@ -14,8 +14,7 @@
 #include "executor/task_runner.hpp"
 #include "executor/thread_pool.hpp"
 #include "network/cluster_view.hpp"
-#include "network/peer_discovery.hpp"
-#include "network/transport.hpp"
+#include "orchestrator/orchestrator.hpp"
 #include "resource_monitor/monitor.hpp"
 #include "scheduler/greedy_policy.hpp"
 #include "scheduler/threshold_policy.hpp"
@@ -236,18 +235,14 @@ int main(int argc, char* argv[]) {
     if (args.port != 0) config.node.port = args.port;
     if (!args.log_dir.empty()) config.telemetry.log_dir = args.log_dir;
 
-    // ── Initialize Logger ────────────────────
-    std::unique_ptr<ILogSink> log_sink;
-    if (!config.telemetry.log_dir.empty()) {
-        log_sink = std::make_unique<JsonFileSink>(config.telemetry.log_dir, "edge_orchestrator");
-    } else {
-        log_sink = std::make_unique<StdoutSink>();
-    }
-    Logger logger(std::move(log_sink), LogLevel::Info);
-    logger.info("EdgeOrchestrator starting...");
-    logger.info("Node ID: " + config.node.id);
-    logger.info("Port: " + std::to_string(config.node.port));
-    logger.info("Scheduler policy: " + config.scheduler.policy);
+    // ── Log sink factory ─────────────────────
+    auto make_sink = [&config]() -> std::unique_ptr<ILogSink> {
+        if (!config.telemetry.log_dir.empty()) {
+            return std::make_unique<JsonFileSink>(config.telemetry.log_dir,
+                                                  "edge_orchestrator");
+        }
+        return std::make_unique<StdoutSink>();
+    };
 
     // Register signal handlers
     std::signal(SIGINT, signal_handler);
@@ -255,95 +250,49 @@ int main(int argc, char* argv[]) {
 
     // ── Demo mode shortcut ───────────────────
     if (args.demo_mode) {
+        Logger logger(make_sink(), LogLevel::Info);
+        logger.info("EdgeOrchestrator starting...");
+        logger.info("Node ID: " + config.node.id);
+        logger.info("Scheduler policy: " + config.scheduler.policy);
         run_demo(config, logger);
         return 0;
     }
 
-    // ── Initialize Executor ──────────────────
-    auto thread_count = config.executor.thread_count == 0
-        ? std::thread::hardware_concurrency()
-        : config.executor.thread_count;
-    ThreadPool pool(thread_count);
-    MemoryPool mem_pool(config.executor.memory_pool_mb * 1024 * 1024);
-    // TaskRunner is available for workload execution via execute_plan()
-    logger.info("Executor: " + std::to_string(thread_count) + " threads, "
-                + std::to_string(config.executor.memory_pool_mb) + " MB pool");
+    auto daemon_sink = make_sink();
 
-    // ── Initialize Resource Monitor ──────────
-    LinuxMonitor monitor(config.node.id, config.monitor.sampling_interval_ms);
-    monitor.on_cpu_threshold(90.0f, [&logger](const ResourceSnapshot&) {
-        logger.warn("CPU usage exceeded 90%");
-    });
-    monitor.on_memory_threshold(85.0f, [&logger](const ResourceSnapshot&) {
-        logger.warn("Memory usage exceeded 85%");
-    });
-    monitor.start();
-    logger.info("Resource monitor started (interval: "
-                + std::to_string(config.monitor.sampling_interval_ms) + "ms)");
-
-    // ── Initialize Network Layer ─────────────
-    ClusterViewManager cluster_mgr;
-
-    PeerDiscovery discovery(config.node.id,
-                            config.node.port,
-                            config.network.heartbeat_interval_ms,
-                            config.network.peer_timeout_ms);
-
-    discovery.on_peer_discovered([&](const PeerInfo& peer) {
-        cluster_mgr.update_peer(peer);
-        logger.info("Peer discovered: " + peer.node_id
-                    + " (CPU " + std::to_string(static_cast<int>(peer.resources.cpu_usage_percent))
-                    + "%, mem " + std::to_string(peer.resources.memory_available_bytes / (1024*1024))
-                    + " MB)");
+    // ── Orchestrator (single composition root) ──
+    // The facade owns executor, monitor, discovery, offload server, and
+    // telemetry, and serves offload requests and workload submissions on
+    // config.node.port (see Orchestrator::handle_message).
+    Orchestrator<LinuxMonitor> orchestrator({
+        .config = config,
+        .log_sink = std::move(daemon_sink),
+        .log_level = LogLevel::Info
     });
 
-    discovery.on_peer_lost([&](const PeerInfo& peer) {
-        cluster_mgr.remove_peer(peer.node_id);
-        logger.warn("Peer lost: " + peer.node_id);
-    });
-
-    // Set up offload server
-    TcpTransport offload_server;
-    auto listen_result = offload_server.listen(config.node.port);
-    if (listen_result.has_value()) {
-        offload_server.serve([&](const std::vector<uint8_t>& request) -> std::vector<uint8_t> {
-            logger.info("Received offload request (" + std::to_string(request.size()) + " bytes)");
-            return request;
-        });
-        logger.info("Offload server listening on port " + std::to_string(config.node.port));
-    } else {
-        logger.warn("Could not start offload server: " + listen_result.error().message);
+    auto start_result = orchestrator.start();
+    if (!start_result.has_value()) {
+        std::cerr << "Failed to start orchestrator: "
+                  << start_result.error().message << std::endl;
+        return 1;
     }
 
-    discovery.start();
-    logger.info("Peer discovery started (heartbeat: "
-                + std::to_string(config.network.heartbeat_interval_ms) + "ms, timeout: "
-                + std::to_string(config.network.peer_timeout_ms) + "ms)");
-
-    // ── Initialize Telemetry ─────────────────
-    auto telemetry_sink = std::make_unique<NullSink>();
-    MetricsCollector metrics(std::move(telemetry_sink));
-    logger.info("Telemetry collector initialized");
-
-    // ── Main Scheduling Loop ─────────────────
-    logger.info("Entering main loop. Press Ctrl+C to shutdown.");
+    // ── Main Loop ────────────────────────────
+    orchestrator.logger().info("Entering main loop. Press Ctrl+C to shutdown.");
 
     uint64_t loop_count = 0;
     while (!g_shutdown_requested) {
-        auto snap_result = monitor.read();
-        if (snap_result.has_value()) {
-            discovery.update_local_resources(*snap_result);
-
-            // Periodic status logging (every 30 seconds at 100ms intervals)
-            if (loop_count % 300 == 0 && loop_count > 0) {
-                auto cluster = cluster_mgr.snapshot();
-                metrics.record_resource_snapshot(*snap_result);
-                logger.info("Status: CPU "
+        // Periodic status logging (every 30 seconds at 100ms intervals)
+        if (loop_count % 300 == 0 && loop_count > 0) {
+            auto snap_result = orchestrator.monitor().read();
+            if (snap_result.has_value()) {
+                orchestrator.metrics().record_resource_snapshot(*snap_result);
+                orchestrator.logger().info("Status: CPU "
                     + std::to_string(static_cast<int>(snap_result->cpu_usage_percent))
                     + "%, mem "
                     + std::to_string(snap_result->memory_available_bytes / (1024*1024))
                     + " MB avail, "
-                    + std::to_string(cluster.available_count()) + " peers");
+                    + std::to_string(orchestrator.cluster().cluster_size()) + " peers");
             }
         }
 
@@ -352,11 +301,9 @@ int main(int argc, char* argv[]) {
     }
 
     // ── Graceful Shutdown ────────────────────
-    logger.info("Shutdown requested. Cleaning up...");
-    discovery.stop();
-    offload_server.stop_serving();
-    monitor.stop();
+    orchestrator.logger().info("Shutdown requested. Cleaning up...");
+    orchestrator.stop();
 
-    logger.info("EdgeOrchestrator stopped.");
+    std::cout << "EdgeOrchestrator stopped." << std::endl;
     return 0;
 }

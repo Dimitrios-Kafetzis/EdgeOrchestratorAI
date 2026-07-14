@@ -27,6 +27,24 @@
 namespace edge_orchestrator {
 
 // ─────────────────────────────────────────────
+// Dispatch
+// ─────────────────────────────────────────────
+
+OffloadCodec::WireKind OffloadCodec::classify(const std::vector<uint8_t>& data) {
+    Envelope env;
+    if (!env.ParseFromArray(data.data(), static_cast<int>(data.size()))) {
+        return WireKind::Unknown;
+    }
+    switch (env.payload_case()) {
+        case Envelope::kOffloadRequest:     return WireKind::OffloadRequest;
+        case Envelope::kOffloadResponse:    return WireKind::OffloadResponse;
+        case Envelope::kWorkloadSubmission: return WireKind::WorkloadSubmission;
+        case Envelope::kWorkloadResult:     return WireKind::WorkloadResult;
+        default:                            return WireKind::Unknown;
+    }
+}
+
+// ─────────────────────────────────────────────
 // Request
 // ─────────────────────────────────────────────
 
@@ -134,6 +152,136 @@ bool OffloadCodec::decode_response(
 
     const auto& out = resp.output_data();
     output.assign(out.begin(), out.end());
+
+    return true;
+}
+
+// ─────────────────────────────────────────────
+// Workload Submission
+// ─────────────────────────────────────────────
+
+std::vector<uint8_t> OffloadCodec::encode_submission(
+    const std::string& workload_id,
+    const WorkloadDAG& dag) {
+
+    Envelope env;
+    auto* sub = env.mutable_workload_submission();
+    sub->set_workload_id(workload_id);
+
+    for (const auto& task_id : dag.topological_order()) {
+        auto task = dag.get_task(task_id);
+        if (!task) continue;
+
+        auto* spec = sub->add_tasks();
+        spec->set_task_id(task->id);
+        spec->set_name(task->name);
+
+        auto* prof = spec->mutable_profile();
+        prof->set_compute_cost_us(static_cast<uint64_t>(task->profile.compute_cost.count()));
+        prof->set_memory_bytes(task->profile.memory_bytes);
+        prof->set_input_bytes(task->profile.input_bytes);
+        prof->set_output_bytes(task->profile.output_bytes);
+
+        for (const auto& dep : task->dependencies) {
+            spec->add_dependencies(dep);
+        }
+    }
+
+    std::vector<uint8_t> buf(env.ByteSizeLong());
+    env.SerializeToArray(buf.data(), static_cast<int>(buf.size()));
+    return buf;
+}
+
+bool OffloadCodec::decode_submission(
+    const std::vector<uint8_t>& data,
+    std::string& workload_id,
+    WorkloadDAG& dag) {
+
+    Envelope env;
+    if (!env.ParseFromArray(data.data(), static_cast<int>(data.size()))) {
+        return false;
+    }
+    if (!env.has_workload_submission()) {
+        return false;
+    }
+
+    const auto& sub = env.workload_submission();
+    workload_id = sub.workload_id();
+
+    // Two passes: every task must exist before edges are added.
+    for (const auto& spec : sub.tasks()) {
+        Task task;
+        task.id = spec.task_id();
+        task.name = spec.name();
+        task.profile.compute_cost = Duration{static_cast<int64_t>(spec.profile().compute_cost_us())};
+        task.profile.memory_bytes = spec.profile().memory_bytes();
+        task.profile.input_bytes = spec.profile().input_bytes();
+        task.profile.output_bytes = spec.profile().output_bytes();
+        dag.add_task(std::move(task));
+    }
+    for (const auto& spec : sub.tasks()) {
+        for (const auto& dep : spec.dependencies()) {
+            dag.add_dependency(dep, spec.task_id());
+        }
+    }
+
+    return dag.is_valid() && !dag.has_cycle();
+}
+
+// ─────────────────────────────────────────────
+// Workload Result
+// ─────────────────────────────────────────────
+
+std::vector<uint8_t> OffloadCodec::encode_workload_result(
+    const std::string& workload_id,
+    bool accepted,
+    const std::string& error_msg,
+    const OrchestrationResult& result) {
+
+    Envelope env;
+    auto* res = env.mutable_workload_result();
+    res->set_workload_id(workload_id);
+    res->set_accepted(accepted);
+    res->set_error_message(error_msg);
+    res->set_local_tasks(result.local_tasks);
+    res->set_offloaded_tasks(result.offloaded_tasks);
+    res->set_completed_tasks(result.completed_tasks);
+    res->set_failed_tasks(result.failed_tasks);
+    res->set_offload_fallbacks(result.offload_fallbacks);
+    res->set_makespan_estimate_us(static_cast<uint64_t>(result.plan.estimated_makespan.count()));
+    res->set_total_duration_us(static_cast<uint64_t>(result.total_duration.count()));
+
+    std::vector<uint8_t> buf(env.ByteSizeLong());
+    env.SerializeToArray(buf.data(), static_cast<int>(buf.size()));
+    return buf;
+}
+
+bool OffloadCodec::decode_workload_result(
+    const std::vector<uint8_t>& data,
+    std::string& workload_id,
+    bool& accepted,
+    std::string& error_msg,
+    OrchestrationResult& result) {
+
+    Envelope env;
+    if (!env.ParseFromArray(data.data(), static_cast<int>(data.size()))) {
+        return false;
+    }
+    if (!env.has_workload_result()) {
+        return false;
+    }
+
+    const auto& res = env.workload_result();
+    workload_id = res.workload_id();
+    accepted = res.accepted();
+    error_msg = res.error_message();
+    result.local_tasks = res.local_tasks();
+    result.offloaded_tasks = res.offloaded_tasks();
+    result.completed_tasks = res.completed_tasks();
+    result.failed_tasks = res.failed_tasks();
+    result.offload_fallbacks = res.offload_fallbacks();
+    result.plan.estimated_makespan = Duration{static_cast<int64_t>(res.makespan_estimate_us())};
+    result.total_duration = Duration{static_cast<int64_t>(res.total_duration_us())};
 
     return true;
 }

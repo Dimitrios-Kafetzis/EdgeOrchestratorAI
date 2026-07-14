@@ -301,6 +301,123 @@ TEST(OffloadE2ETest, OffloadFallsBackWhenPeerUnreachable) {
 }
 
 // ═══════════════════════════════════════════════
+// Workload Submission
+// ═══════════════════════════════════════════════
+
+TEST(WorkloadSubmissionTest, CodecRoundTrip) {
+    TaskProfile profile{.compute_cost = Duration{5000}, .memory_bytes = 65536,
+                        .input_bytes = 1024, .output_bytes = 2048};
+    auto dag = WorkloadGenerator::diamond(2, 3, profile);
+
+    auto encoded = OffloadCodec::encode_submission("wl-7", dag);
+    EXPECT_EQ(OffloadCodec::classify(encoded),
+              OffloadCodec::WireKind::WorkloadSubmission);
+
+    std::string workload_id;
+    WorkloadDAG decoded;
+    ASSERT_TRUE(OffloadCodec::decode_submission(encoded, workload_id, decoded));
+
+    EXPECT_EQ(workload_id, "wl-7");
+    EXPECT_EQ(decoded.task_count(), dag.task_count());
+    EXPECT_EQ(decoded.critical_path_cost(), dag.critical_path_cost());
+
+    for (const auto& id : dag.topological_order()) {
+        auto original = dag.get_task(id);
+        auto copy = decoded.get_task(id);
+        ASSERT_TRUE(copy.has_value());
+        EXPECT_EQ(copy->profile, original->profile);
+        EXPECT_EQ(copy->dependencies, original->dependencies);
+    }
+}
+
+TEST(WorkloadSubmissionTest, RejectsMalformedSubmission) {
+    std::string id;
+    WorkloadDAG dag;
+    std::vector<uint8_t> garbage{0xDE, 0xAD, 0xBE, 0xEF};
+    EXPECT_FALSE(OffloadCodec::decode_submission(garbage, id, dag));
+}
+
+// A client submits a workload over TCP and gets back an executed result —
+// the same path tools/workload_injector.py uses.
+TEST(WorkloadSubmissionTest, SubmitOverTcp) {
+    auto config = default_config();
+    config.node.id = "submission-node";
+    config.node.port = 19965;
+    config.executor.thread_count = 2;
+    config.executor.memory_pool_mb = 4;
+    config.scheduler.policy = "greedy";
+
+    Orchestrator<MockMonitor> orch({
+        .config = config,
+        .log_sink = std::make_unique<NullSink>(),
+        .log_level = LogLevel::Debug
+    });
+    orch.monitor().set_cpu(20.0f);
+    orch.monitor().set_memory(3ULL * 1024 * 1024 * 1024, 4ULL * 1024 * 1024 * 1024);
+    ASSERT_TRUE(orch.start().has_value());
+
+    TaskProfile profile{.compute_cost = Duration{1000}, .memory_bytes = 4096};
+    auto dag = WorkloadGenerator::linear_chain(3, profile);
+
+    TcpTransport client;
+    ASSERT_TRUE(client.connect("127.0.0.1", config.node.port, 2000).has_value());
+    ASSERT_TRUE(client.send(OffloadCodec::encode_submission("wl-tcp", dag)).has_value());
+
+    auto reply = client.receive(15000);
+    ASSERT_TRUE(reply.has_value());
+
+    std::string workload_id;
+    bool accepted = false;
+    std::string error;
+    OrchestrationResult result;
+    ASSERT_TRUE(OffloadCodec::decode_workload_result(*reply, workload_id,
+                                                     accepted, error, result));
+    EXPECT_EQ(workload_id, "wl-tcp");
+    EXPECT_TRUE(accepted) << error;
+    EXPECT_EQ(result.completed_tasks, dag.task_count());
+    EXPECT_EQ(result.failed_tasks, 0u);
+
+    client.disconnect();
+    orch.stop();
+}
+
+// Regression: the arena is wholesale-reset at workload boundaries. Without
+// the reset, allocations accumulate across submissions and the second
+// workload here would exhaust the 4 MB pool and fail tasks.
+TEST(WorkloadSubmissionTest, ArenaResetsBetweenWorkloads) {
+    auto config = default_config();
+    config.node.id = "arena-node";
+    config.node.port = 19966;
+    config.executor.thread_count = 2;
+    config.executor.memory_pool_mb = 4;
+    config.scheduler.policy = "greedy";
+
+    Orchestrator<MockMonitor> orch({
+        .config = config,
+        .log_sink = std::make_unique<NullSink>(),
+        .log_level = LogLevel::Debug
+    });
+    orch.monitor().set_cpu(20.0f);
+    orch.monitor().set_memory(3ULL * 1024 * 1024 * 1024, 4ULL * 1024 * 1024 * 1024);
+    ASSERT_TRUE(orch.start().has_value());
+
+    // Each workload allocates ~3 MB of the 4 MB budget.
+    TaskProfile profile{.compute_cost = Duration{500},
+                        .memory_bytes = 1024 * 1024};
+    auto dag = WorkloadGenerator::linear_chain(3, profile);
+
+    for (int round = 0; round < 3; ++round) {
+        auto result = orch.submit_workload(dag);
+        ASSERT_TRUE(result.has_value());
+        EXPECT_EQ(result->completed_tasks, dag.task_count())
+            << "workload round " << round << " lost tasks to arena exhaustion";
+        EXPECT_EQ(result->failed_tasks, 0u);
+    }
+
+    orch.stop();
+}
+
+// ═══════════════════════════════════════════════
 // Orchestrator with MockMonitor
 // ═══════════════════════════════════════════════
 
