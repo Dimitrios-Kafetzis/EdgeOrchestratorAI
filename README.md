@@ -67,8 +67,8 @@ See [docs/research_context.md](docs/research_context.md) for full academic conte
 ### Build and Test
 
 ```bash
-git clone https://github.com/dimitris-kafetzis/EdgeOrchestrator.git
-cd EdgeOrchestrator
+git clone https://github.com/Dimitrios-Kafetzis/EdgeOrchestratorAI.git
+cd EdgeOrchestratorAI
 cmake -B build -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTS=ON
 cmake --build build -j$(nproc)
 cd build && ctest --output-on-failure
