@@ -15,7 +15,7 @@
 
 #include <algorithm>
 #include <cmath>
-#include <format>
+#include <string>
 
 namespace edge_orchestrator {
 
@@ -30,8 +30,8 @@ WorkloadDAG WorkloadGenerator::linear_chain(size_t num_tasks, TaskProfile base_p
     TaskId prev_id;
     for (size_t i = 0; i < num_tasks; ++i) {
         Task task{
-            .id = std::format("chain_{}", i),
-            .name = std::format("Chain Task {}", i),
+            .id = "chain_" + std::to_string(i),
+            .name = "Chain Task " + std::to_string(i),
             .profile = base_profile,
             .dependencies = {},
             .state = TaskState::Pending
@@ -74,10 +74,10 @@ WorkloadDAG WorkloadGenerator::fan_out_fan_in(size_t width, TaskProfile base_pro
     // Parallel branch tasks
     std::vector<TaskId> branch_ids;
     for (size_t i = 0; i < width; ++i) {
-        auto branch_id = std::format("fan_branch_{}", i);
+        auto branch_id = "fan_branch_" + std::to_string(i);
         dag.add_task(Task{
             .id = branch_id,
-            .name = std::format("Branch {}", i),
+            .name = "Branch " + std::to_string(i),
             .profile = base_profile,
             .dependencies = {},
             .state = TaskState::Pending
@@ -128,10 +128,10 @@ WorkloadDAG WorkloadGenerator::diamond(size_t depth, size_t width, TaskProfile b
 
     for (size_t d = 0; d < depth; ++d) {
         // Hub task at the start of this diamond level
-        auto hub_id = std::format("hub_{}", d);
+        auto hub_id = "hub_" + std::to_string(d);
         dag.add_task(Task{
             .id = hub_id,
-            .name = std::format("Hub {}", d),
+            .name = "Hub " + std::to_string(d),
             .profile = base_profile,
             .dependencies = {},
             .state = TaskState::Pending
@@ -144,10 +144,10 @@ WorkloadDAG WorkloadGenerator::diamond(size_t depth, size_t width, TaskProfile b
         // Parallel branches
         std::vector<TaskId> branch_ids;
         for (size_t w = 0; w < width; ++w) {
-            auto branch_id = std::format("diamond_{}_{}", d, w);
+            auto branch_id = "diamond_" + std::to_string(d) + "_" + std::to_string(w);
             dag.add_task(Task{
                 .id = branch_id,
-                .name = std::format("Diamond D{} B{}", d, w),
+                .name = "Diamond D" + std::to_string(d) + " B" + std::to_string(w),
                 .profile = base_profile,
                 .dependencies = {},
                 .state = TaskState::Pending
@@ -157,10 +157,10 @@ WorkloadDAG WorkloadGenerator::diamond(size_t depth, size_t width, TaskProfile b
         }
 
         // Convergence hub
-        auto sink_id = std::format("merge_{}", d);
+        auto sink_id = "merge_" + std::to_string(d);
         dag.add_task(Task{
             .id = sink_id,
-            .name = std::format("Merge {}", d),
+            .name = "Merge " + std::to_string(d),
             .profile = base_profile,
             .dependencies = {},
             .state = TaskState::Pending
@@ -200,13 +200,13 @@ WorkloadDAG WorkloadGenerator::transformer_layers(size_t num_layers,
         // Attention sub-task
         // Compute cost scales with hidden_dim^2 (self-attention is O(n*d^2))
         // Memory includes KV-cache that grows with layer depth
-        auto attn_id = std::format("layer_{}_attn", i);
+        auto attn_id = "layer_" + std::to_string(i) + "_attn";
         uint64_t attn_memory = hidden_dim * hidden_dim * 4  // weight matrices
                              + kv_cache_bytes_per_layer * (i + 1);  // cumulative KV-cache
 
         dag.add_task(Task{
             .id = attn_id,
-            .name = std::format("Layer {} Attention", i),
+            .name = "Layer " + std::to_string(i) + " Attention",
             .profile = TaskProfile{
                 .compute_cost = Duration{static_cast<int64_t>(hidden_dim * 2)},
                 .memory_bytes = attn_memory,
@@ -224,12 +224,12 @@ WorkloadDAG WorkloadGenerator::transformer_layers(size_t num_layers,
         // FFN sub-task
         // Compute cost is typically 4x hidden_dim (two linear layers with 4*d intermediate)
         // Memory is dominated by the weight matrices
-        auto ffn_id = std::format("layer_{}_ffn", i);
+        auto ffn_id = "layer_" + std::to_string(i) + "_ffn";
         uint64_t ffn_memory = hidden_dim * hidden_dim * 4 * sizeof(float);  // 4*d intermediate
 
         dag.add_task(Task{
             .id = ffn_id,
-            .name = std::format("Layer {} FFN", i),
+            .name = "Layer " + std::to_string(i) + " FFN",
             .profile = TaskProfile{
                 .compute_cost = Duration{static_cast<int64_t>(hidden_dim * 4)},
                 .memory_bytes = ffn_memory,
@@ -277,7 +277,7 @@ WorkloadDAG WorkloadGenerator::random_dag(size_t num_tasks,
     task_ids.reserve(num_tasks);
 
     for (size_t i = 0; i < num_tasks; ++i) {
-        auto id = std::format("rand_{}", i);
+        auto id = "rand_" + std::to_string(i);
         TaskProfile profile{
             .compute_cost = rand_duration(min_profile.compute_cost, max_profile.compute_cost),
             .memory_bytes = rand_uint64(min_profile.memory_bytes, max_profile.memory_bytes),
@@ -287,7 +287,7 @@ WorkloadDAG WorkloadGenerator::random_dag(size_t num_tasks,
 
         dag.add_task(Task{
             .id = id,
-            .name = std::format("Random Task {}", i),
+            .name = "Random Task " + std::to_string(i),
             .profile = profile,
             .dependencies = {},
             .state = TaskState::Pending
