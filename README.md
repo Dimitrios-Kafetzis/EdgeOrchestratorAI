@@ -51,7 +51,27 @@ EdgeOrchestrator is a lightweight daemon designed for clusters of Raspberry Pi (
 - **Lock-free executor hand-off** — bounded Vyukov MPMC queue with semaphore-gated workers, benchmarked against the mutex baseline
 - **Modern C++20** — Concepts (enforced by static_assert), coroutines, `std::jthread`, `std::counting_semaphore`, `std::atomic<shared_ptr>`, `Result<T,E>` monad
 - **178 tests** — Unit, integration, and end-to-end tests covering all modules, including live two-node offload and failure-path coverage
-- **Cross-compilable** — CMake toolchain for `aarch64-linux-gnu`, CI via GitHub Actions
+- **Measured, not claimed** — full benchmark campaign on real Raspberry Pi 4 hardware and a two-node Pi + x86 cluster over a live WLAN: [docs/BENCHMARKS.md](docs/BENCHMARKS.md)
+- **Cross-compilable** — CMake toolchain for `aarch64-linux-gnu`, CI via GitHub Actions; builds natively on Raspberry Pi OS bookworm (GCC 12)
+
+## Documentation Map
+
+Start here depending on what you are after:
+
+| Document | Read it when you want… |
+|---|---|
+| this README | to build, run, and get a first mental model of the system |
+| [docs/DESIGN.md](docs/DESIGN.md) | the comprehensive design document: module responsibilities, threading model, wire protocols, and the rationale (and rejected alternatives) behind each decision |
+| [docs/API.md](docs/API.md) | a quick per-module API reference for writing code against the library targets |
+| [docs/BENCHMARKS.md](docs/BENCHMARKS.md) | measured numbers from real hardware: scheduling latency and plan quality per policy, offload round-trip breakdown, monitor overhead, discovery under packet loss, partition behaviour — plus methodology and limitations |
+| [docs/research_context.md](docs/research_context.md) | the academic lineage: which published formulations the optimizer policy adapts, and what was simplified on the way to a running system |
+| [config/default.toml](config/default.toml) | every runtime knob, commented |
+| `tools/` | the Python workload injector and NDJSON log analyzer (usage below) |
+
+The source itself is documented with Doxygen-style comments (`@brief`,
+`@param`, design-rationale blocks in the file headers), so an API site
+can be generated with any Doxygen-compatible pipeline (e.g. mkdocs +
+mkdoxy) without further annotation work.
 
 ## Research Context
 
@@ -80,16 +100,42 @@ cd build && ctest --output-on-failure
 ### Run the Daemon
 
 ```bash
-# Single node with demo workload
+# Single node with demo workload (schedules a transformer DAG under all
+# three policies, prints the comparison, executes the optimizer's plan)
 ./build/edge_orchestrator --demo
 
 # Production mode
-./build/edge_orchestrator --config config/default.toml --node-id rpi-01 --port 5200
+./build/edge_orchestrator --config config/default.toml --node-id rpi-01 --port 5201
 
-# Multi-node (separate terminals)
+# Multi-node on one machine (separate terminals): distinct TCP ports,
+# shared UDP discovery_port (5200 from default.toml) — the daemons
+# discover each other via broadcast within one heartbeat (2 s)
 ./build/edge_orchestrator --node-id node-A --port 5201
 ./build/edge_orchestrator --node-id node-B --port 5202
 ./build/edge_orchestrator --node-id node-C --port 5203
+
+# Multi-node across machines: identical invocation on each host, same
+# config; only --node-id needs to differ
+./build/edge_orchestrator --node-id rpi-01     # on the Pi
+./build/edge_orchestrator --node-id devbox     # on the workstation
+```
+
+### Submit a Workload
+
+`tools/workload_injector.py` is a standalone Protobuf client that sends a
+whole DAG to a running daemon over TCP and waits for the executed result
+(local/offloaded/failed counts, makespan, wall time):
+
+```bash
+# One-time: generate the Python bindings and install the runtime
+protoc -Iproto --python_out=tools protocol.proto
+pip install "protobuf>=4.21"
+
+python3 tools/workload_injector.py --target 127.0.0.1:5201 \
+    --topology chain --tasks 8 --compute-ms 20
+
+# Then inspect the daemon's NDJSON telemetry
+python3 tools/log_analyzer.py --summary logs/metrics.ndjson
 ```
 
 ### Cross-Compile for Raspberry Pi
@@ -104,12 +150,13 @@ cmake --build build-arm -j$(nproc)
 ## Project Structure
 
 ```
-EdgeOrchestrator/                   ~10,300 lines of C++20 across 77 tracked files
+EdgeOrchestrator/                   ~10,700 lines of C++20 across 79 tracked files
 ├── src/
 │   ├── core/                       Types, Result<T,E>, Config, Logger, Concepts
 │   │   ├── types.hpp               ResourceSnapshot, TaskProfile, Duration
 │   │   ├── result.hpp              Monadic Result<T,E> with map/and_then
 │   │   ├── concepts.hpp            ResourceMonitorLike, SchedulingPolicyLike
+│   │   ├── async.hpp               Coroutine primitives: Async<T>, DetachedTask
 │   │   ├── config.{hpp,cpp}        TOML configuration loading
 │   │   └── logger.{hpp,cpp}        Structured logging with pluggable sinks
 │   ├── resource_monitor/           Real-time Linux resource sensing
@@ -127,43 +174,38 @@ EdgeOrchestrator/                   ~10,300 lines of C++20 across 77 tracked fil
 │   │   └── cluster_view.cpp        ClusterView helper methods
 │   ├── executor/                   Managed task execution
 │   │   ├── thread_pool.{hpp,cpp}   Fixed-size pool with std::jthread + stop tokens
+│   │   ├── mpmc_queue.hpp          Bounded lock-free Vyukov MPMC queue (the pool's hand-off)
 │   │   ├── memory_pool.{hpp,cpp}   Arena allocator with budget enforcement
 │   │   └── task_runner.{hpp,cpp}   Task execution with memory tracking
 │   ├── network/                    Inter-node communication
 │   │   ├── peer_discovery.{hpp,cpp}  UDP broadcast, heartbeat, peer eviction
-│   │   ├── transport.{hpp,cpp}       Length-prefixed TCP with poll()-based I/O
+│   │   ├── transport.{hpp,cpp}       Length-prefixed TCP with poll()-based I/O (sync client)
+│   │   ├── reactor.{hpp,cpp}         epoll reactor driving the async server
+│   │   ├── async_transport.{hpp,cpp} Coroutine TCP server (many connections, one reactor thread)
 │   │   └── cluster_view.{hpp,cpp}    Thread-safe peer state management
 │   ├── orchestrator/               Top-level facade
 │   │   ├── orchestrator.hpp        Orchestrator<MonitorT> template, lifecycle, wiring
-│   │   └── offload_codec.cpp       Binary serialization for task offloading
+│   │   └── offload_codec.cpp       Protobuf Envelope encode/decode (quarantined here)
 │   ├── telemetry/                  Structured event logging
 │   │   ├── metrics_collector.{hpp,cpp}  Event recording API
 │   │   └── json_sink.{hpp,cpp}         NDJSON file output, null sink
 │   └── app/
 │       └── main.cpp                Daemon entry point, CLI, --demo mode
 ├── tests/
-│   ├── unit/                       11 test files, 160 test cases
-│   │   ├── test_result.cpp         Result monad operations
-│   │   ├── test_types.cpp          ResourceSnapshot, TaskProfile
-│   │   ├── test_config.cpp         TOML loading, defaults, error cases
-│   │   ├── test_dag.cpp            DAG construction, topo sort, cycles, critical path
-│   │   ├── test_generator.cpp      All 5 workload topologies
-│   │   ├── test_thread_pool.cpp    Submit, concurrency, thread count
-│   │   ├── test_memory_pool.cpp    Alloc, reset, capacity, OOM
-│   │   ├── test_monitor.cpp        MockMonitor + LinuxMonitor
-│   │   ├── test_scheduler.cpp      All 3 policies, cluster view, comparisons
-│   │   ├── test_network.cpp        ClusterViewManager, TcpTransport, PeerDiscovery
-│   │   └── test_orchestrator.cpp   OffloadCodec, Orchestrator<MockMonitor> E2E
+│   ├── unit/                       11 test files (see table below)
 │   ├── integration/
 │   │   └── test_single_node.cpp    Full pipeline tests, two-node comms, E2E
 │   └── benchmark/
-│       └── bench_scheduler.cpp     Scheduling overhead measurement
+│       ├── bench_scheduler.cpp     Scheduling latency + --sweep policy campaign (CSV)
+│       ├── bench_queue.cpp         Lock-free MPMC vs mutex+queue hand-off throughput
+│       └── bench_offload.cpp       Cross-node offload round trip, per-phase timing
 ├── docs/
-│   ├── DESIGN.md                   Comprehensive design document (46KB)
-│   ├── research_context.md         Academic context and publication mapping
-│   └── API.md                      Module API quick reference
+│   ├── DESIGN.md                   Comprehensive design document
+│   ├── API.md                      Module API quick reference
+│   ├── BENCHMARKS.md               Measured results from Raspberry Pi hardware
+│   └── research_context.md         Academic context and publication mapping
 ├── proto/
-│   └── protocol.proto              Protobuf definitions (NodeAdvertisement, Offload)
+│   └── protocol.proto              Protobuf definitions (Envelope, Offload, Workload)
 ├── config/
 │   └── default.toml                Default daemon configuration
 ├── cmake/
@@ -178,18 +220,37 @@ EdgeOrchestrator/                   ~10,300 lines of C++20 across 77 tracked fil
 
 ## Test Suite
 
-**160 tests, all passing.** Test time: ~9 seconds.
+**178 tests, all passing** — on x86 CI (Debug, Release, ASan/UBSan) and
+natively on a Raspberry Pi 4. Test time: ~9 seconds.
 
 | Test Target | Tests | Coverage |
 |-------------|-------|----------|
 | `test_core` | 16 | Result monad, types, config parsing |
-| `test_workload` | 27 | DAG operations, 5 workload generators |
-| `test_executor` | 10 | Thread pool, memory pool |
+| `test_workload` | 49 | DAG operations, 5 workload generators |
+| `test_executor` | 15 | Thread pool, MPMC queue, memory pool |
 | `test_monitor` | 13 | LinuxMonitor (/proc parsing), MockMonitor |
-| `test_scheduler` | 23 | 3 policies, cluster view, cross-policy comparison |
-| `test_network` | 26 | ClusterViewManager, TCP round-trip, UDP discovery + eviction |
-| `test_orchestrator` | 15 | OffloadCodec, Orchestrator facade, policy selection |
-| `test_integration` | 30 | Full pipeline, two-node TCP, E2E orchestration |
+| `test_scheduler` | 22 | 3 policies, cluster view, cross-policy comparison |
+| `test_network` | 30 | ClusterViewManager, TCP round-trip, UDP discovery + eviction |
+| `test_orchestrator` | 22 | OffloadCodec, Orchestrator facade, policy selection |
+| `test_integration` | 11 | Full pipeline, two-node TCP, E2E orchestration |
+
+## Benchmarks
+
+Full campaign with methodology and limitations in
+[docs/BENCHMARKS.md](docs/BENCHMARKS.md); measured on a Raspberry Pi 4
+(8 GB) and a two-node Pi + x86 cluster over a live WLAN. Headlines:
+
+- Greedy and threshold schedule in **microseconds** at every size; the
+  optimizer improves makespan on parallelizable DAGs by **58–78 %** at 5
+  nodes but its latency grows to ~0.9 s at 500 dense tasks — the
+  crossover analysis is why threshold is the deployed default.
+- On sequential DAGs (transformer inference) the optimizer correctly
+  keeps 100 % of tasks local: distribution cannot beat the critical path.
+- A real offload round trip costs **5.5 ms** (empty) / 38 ms (+64 KiB)
+  Pi↔x86 over Wi-Fi; Protobuf encode/decode is ≤ 136 µs of that.
+- The idle daemon costs **0.23 %** of one Pi core at the default 500 ms
+  sampling; discovery survives 30 % datagram loss with ~3 short-lived
+  spurious evictions per 5 min; a network partition loses **zero tasks**.
 
 ## C++20 Features Used
 
@@ -211,7 +272,8 @@ See [`config/default.toml`](config/default.toml) for all options. Key settings:
 ```toml
 [node]
 id = "node-01"
-port = 5201
+port = 5201                    # TCP: offload + workload submission
+discovery_port = 5200          # UDP: heartbeat broadcast (cluster-wide)
 
 [scheduler]
 policy = "greedy"              # "greedy" | "threshold" | "optimizer"
