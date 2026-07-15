@@ -2,6 +2,12 @@
  * @file logger.cpp
  * @brief Logger implementation with ISO 8601 timestamps.
  * @author Dimitris Kafetzis
+ *
+ * Same NDJSON discipline as the metrics stream, different channel:
+ * logs are for humans reading a node's story, metrics for tools
+ * aggregating events — the daemon writes them to separate files so
+ * neither pollutes the other. Level filtering happens before any
+ * formatting work; a filtered-out debug() costs one comparison.
  */
 
 #include "core/logger.hpp"

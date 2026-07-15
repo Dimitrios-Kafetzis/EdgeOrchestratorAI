@@ -2,6 +2,13 @@
  * @file config.cpp
  * @brief Configuration loading from TOML files using toml++.
  * @author Dimitris Kafetzis
+ *
+ * Every field is value_or(default), so a partial file is a valid file:
+ * deployments override only what they care about, and a missing table
+ * silently means "all defaults". The one hard failure is a file that
+ * exists but does not parse — that is a typo the operator must hear
+ * about, not paper over. Defaults here must match default_config() and
+ * config/default.toml; the config unit tests pin all three together.
  */
 
 #include "core/config.hpp"

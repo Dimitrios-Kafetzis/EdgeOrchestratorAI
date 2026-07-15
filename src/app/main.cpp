@@ -5,6 +5,15 @@
  *
  * Wires all modules into a complete orchestration pipeline:
  *   Config → Logger → Monitor → Discovery → ClusterView → Scheduler → Executor → Telemetry
+ *
+ * Deliberately thin: parse CLI, load config, choose sinks, then hand
+ * everything to the Orchestrator facade, which is the single
+ * composition root. Anything main() would wire by hand is something
+ * the integration tests could not reach — so main() wires nothing by
+ * hand. The two extras that live here are --demo (a self-contained
+ * scheduling walkthrough with a mock monitor, useful as a smoke test
+ * and as documentation-by-example) and the signal handler, which flips
+ * one flag; the main loop owns the actual shutdown sequencing.
  */
 
 #include "core/config.hpp"

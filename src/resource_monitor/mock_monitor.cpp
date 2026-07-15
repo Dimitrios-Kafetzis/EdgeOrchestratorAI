@@ -2,6 +2,14 @@
  * @file mock_monitor.cpp
  * @brief MockMonitor implementation — configurable resource snapshots for testing.
  * @author Dimitris Kafetzis
+ *
+ * Two modes: a static snapshot (defaults shaped like an idle Pi 4) for
+ * tests that just need a plausible node, and a scripted sequence for
+ * tests that drive a scenario — e.g. rising load pushing the threshold
+ * policy across its offload boundary. Sequence exhaustion returns an
+ * error on purpose: a test that reads more snapshots than it scripted
+ * has a bug, and silence would hide it. Satisfies ResourceMonitorLike,
+ * so Orchestrator<MockMonitor> is the whole integration-test rig.
  */
 
 #include "resource_monitor/monitor.hpp"

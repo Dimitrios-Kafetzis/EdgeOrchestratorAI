@@ -2,6 +2,15 @@
  * @file metrics_collector.cpp
  * @brief MetricsCollector implementation.
  * @author Dimitris Kafetzis
+ *
+ * Events are hand-assembled NDJSON lines, one object per line, pushed
+ * through the same ILogSink abstraction the logger uses. Hand-assembled
+ * because the schema is tiny, fixed, and hot (a task event per task per
+ * workload): pulling in a JSON library for five string formats would be
+ * a dependency in exchange for nothing. The one rule callers must keep
+ * is that record_custom's payload is already-valid JSON — it is spliced
+ * in verbatim. tools/log_analyzer.py is the consumer these lines are
+ * shaped for.
  */
 
 #include "telemetry/metrics_collector.hpp"
@@ -62,6 +71,9 @@ void MetricsCollector::record_custom(std::string_view event, std::string_view js
     emit(oss.str());
 }
 
+/// Single writer lock: events from executor workers, discovery
+/// callbacks, and the main loop interleave here, and NDJSON is only
+/// parseable if lines never tear.
 void MetricsCollector::emit(std::string_view json_line) {
     std::lock_guard lock(write_mutex_);
     sink_->write(json_line);
