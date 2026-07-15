@@ -103,3 +103,8 @@ add_executable(bench_queue
     benchmark/bench_queue.cpp
 )
 target_link_libraries(bench_queue PRIVATE eo_executor)
+
+add_executable(bench_offload
+    benchmark/bench_offload.cpp
+)
+target_link_libraries(bench_offload PRIVATE eo_orchestrator)
