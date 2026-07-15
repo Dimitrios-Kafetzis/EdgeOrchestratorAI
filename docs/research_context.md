@@ -4,7 +4,7 @@
 
 This project is a practical realization of research conducted at the **Athens University of Economics and Business** (AUEB), Department of Informatics, under the supervision of **Professor Iordanis Koutsopoulos**.
 
-The EdgeOrchestrator system implements scheduling and partitioning algorithms inspired by published work on deploying AI inference workloads across resource-constrained wireless edge networks. The synthetic workload model mirrors the computational characteristics of transformer layers (configurable compute cost, memory footprint, KV-cache growth, inter-layer data dependencies), and the optimization-based scheduling policy implements a lightweight version of the partitioning formulations from the research below.
+The EdgeOrchestrator system **adapts ideas from** published work on deploying AI inference workloads across resource-constrained wireless edge networks; it does not reimplement any paper's formulation exactly. The synthetic workload model mirrors the computational characteristics of transformer layers (configurable compute cost, memory footprint, KV-cache growth, inter-layer data dependencies). The optimizer policy is a fast heuristic in the same problem family as the published formulations — makespan minimization under per-node resource constraints with a dependency-aware timing model — with deliberate simplifications for a sub-millisecond scheduling budget: a scalar communication weight instead of per-link bandwidth, one execution slot per node, and hill-climbing local search instead of exact optimization. The honest relationship is "research-informed engineering," and the simplifications are documented in `docs/DESIGN.md` §7.3.
 
 ## Research Areas and Publications
 
@@ -24,7 +24,7 @@ Extending DNN partitioning strategies to large language model (transformer) arch
 
 Cross-layer similarity discovery and layer-level speculative execution for reduced end-to-end inference latency in multi-device deployments. This extends single-layer optimization to multi-layer settings with synergistic clustering — the active focus of the PhD dissertation.
 
-**Mapping to code:** `scheduler/optimizer_policy.cpp` (critical path assignment exploits layer ordering, local search explores cross-layer placement improvements)
+**Mapping to code:** none yet — speculative execution and cross-layer similarity are **not implemented** in EdgeOrchestrator; they are listed on the v2.0 roadmap. What the optimizer shares with this line of work is only the multi-layer DAG framing and the dependency-aware makespan objective.
 
 ### 4. AI-based QoE Prediction for Teleoperated Autonomous Vehicles
 
@@ -45,7 +45,7 @@ Collaborative research on IDS-controller placement in SDN-MANETs (published at I
 | Per-layer cost modeling | `core/types.hpp` | `TaskProfile` with compute, memory, input/output bytes |
 | DAG-based workload representation | `workload/dag.hpp` | `WorkloadDAG` with topological ordering and critical path |
 | Transformer layer topology | `workload/generator.cpp` | `transformer_layers()` with attention + FFN per layer, growing KV-cache |
-| Communication-aware partitioning | `scheduler/optimizer_policy.cpp` | Makespan model includes `communication_weight × transfer_cost` |
+| Communication-aware partitioning | `scheduler/optimizer_policy.cpp` | Dependency-aware list-schedule makespan: cross-node edges pay `communication_weight × output_bytes`; a scalar weight, not a per-link bandwidth model |
 | Resource-constrained placement | `scheduler/scheduler.hpp` | Per-node CPU and memory constraint enforcement |
 | Dynamic resource sensing | `resource_monitor/linux_monitor.cpp` | Real-time /proc and /sys parsing with threshold callbacks |
 | Adaptive offloading | `scheduler/threshold_policy.cpp` | Offload when CPU or memory exceeds configurable thresholds |
@@ -53,7 +53,7 @@ Collaborative research on IDS-controller placement in SDN-MANETs (published at I
 | Bin packing heuristic | `scheduler/optimizer_policy.cpp` | Phase 2: FFD assignment of remaining tasks |
 | Local search improvement | `scheduler/optimizer_policy.cpp` | Phase 3: Random swap-based makespan reduction |
 | Peer discovery | `network/peer_discovery.cpp` | UDP broadcast with packed 72-byte advertisement packets |
-| Task offloading | `network/transport.cpp` | Length-prefixed TCP with binary OffloadCodec |
+| Task offloading | `network/transport.cpp`, `network/async_transport.cpp`, `orchestrator/offload_codec.cpp` | Protobuf Envelope over length-prefixed TCP; async epoll server, sync client; local fallback on peer failure |
 | Cluster management | `network/cluster_view.cpp` | Thread-safe peer state with heartbeat-based eviction |
 
 ## Experimental Validation

@@ -66,20 +66,4 @@ concept SchedulingPolicyLike = requires(
     { policy.name() } -> std::convertible_to<std::string_view>;
 };
 
-// ─────────────────────────────────────────────
-// SerializerLike
-// ─────────────────────────────────────────────
-
-/**
- * @concept SerializerLike
- * @brief Constrains types that can serialize/deserialize messages.
- *
- * Used in the network layer for every send/receive operation.
- */
-template <typename T, typename MessageT>
-concept SerializerLike = requires(T serializer, const MessageT& msg, std::span<const std::byte> data) {
-    { serializer.serialize(msg) } -> std::same_as<std::vector<std::byte>>;
-    { serializer.deserialize(data) } -> std::same_as<Result<MessageT>>;
-};
-
 }  // namespace edge_orchestrator

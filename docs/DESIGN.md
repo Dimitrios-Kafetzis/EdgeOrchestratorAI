@@ -188,7 +188,7 @@ sequenceDiagram
 
 1. **Separation of Concerns:** Each module has a single responsibility and communicates through well-defined interfaces.
 2. **Hybrid Polymorphism:** Concepts (static polymorphism) for performance-critical hot paths (scheduling, execution). Virtual interfaces for configuration-time flexibility (config loaders, log sinks).
-3. **Zero-Cost Where It Matters:** No dynamic allocation in the execution hot path. Arena allocators for task metadata, `std::span` for zero-copy buffer views.
+3. **Zero-Cost Where It Matters:** No dynamic allocation in the execution hot path. Arena allocator with a hard budget for task working memory; lock-free task hand-off.
 4. **Testability First:** Every module depends on abstractions, not concretions. Mock implementations for resource monitor, network, and executor enable comprehensive unit testing.
 5. **Graceful Degradation:** If a peer node becomes unreachable, tasks are rescheduled locally. If local resources are exhausted, tasks are queued rather than dropped.
 
@@ -326,8 +326,8 @@ public:
     // Queries
     [[nodiscard]] std::vector<TaskId> topological_order() const;
     [[nodiscard]] std::vector<TaskId> ready_tasks() const;        // No unmet dependencies
-    [[nodiscard]] std::span<const TaskId> dependents(TaskId) const;
-    [[nodiscard]] std::span<const TaskId> dependencies(TaskId) const;
+    [[nodiscard]] std::vector<TaskId> dependents(const TaskId&) const;
+    [[nodiscard]] std::vector<TaskId> dependencies(const TaskId&) const;
     [[nodiscard]] bool is_valid() const;                          // Acyclicity check
 
     // State updates
@@ -416,18 +416,17 @@ Three policies are provided (see [Section 7](#7-scheduling-policies) for algorit
 
 **Policy Selection at Runtime:**
 
-While individual policies are concept-constrained (compile-time dispatch), the daemon selects which policy to instantiate based on configuration. This is achieved via a `std::variant<GreedyPolicy, ThresholdPolicy, OptimizerPolicy>` and `std::visit`, avoiding virtual dispatch while preserving runtime configurability.
+The policy is chosen from configuration (`scheduler.policy` in TOML), so the variation axis is *runtime*: policies implement the `ISchedulingPolicy` virtual interface and the orchestrator holds a `std::unique_ptr<ISchedulingPolicy>` created by `create_policy()`. One virtual call per scheduling round is noise next to the O(T·N) work inside the policy, so buying that flexibility with a vtable is the right trade.
 
 ```cpp
-using PolicyVariant = std::variant<GreedyPolicy, ThresholdPolicy, OptimizerPolicy>;
-
-SchedulingPlan schedule(PolicyVariant& policy,
-                        const WorkloadDAG& dag,
-                        const ResourceSnapshot& local,
-                        const ClusterView& cluster) {
-    return std::visit([&](auto& p) { return p.schedule(dag, local, cluster); }, policy);
+std::unique_ptr<ISchedulingPolicy> Orchestrator::create_policy() const {
+    if (config_.scheduler.policy == "threshold") return std::make_unique<ThresholdPolicy>(...);
+    if (config_.scheduler.policy == "optimizer") return std::make_unique<OptimizerPolicy>(...);
+    return std::make_unique<GreedyPolicy>();  // default
 }
 ```
+
+The `SchedulingPolicyLike` concept covers the *compile-time* axis instead: it documents the policy contract and is enforced with `static_assert`s in the test suite, so a policy that drifts from the interface fails to compile rather than failing at runtime. (Contrast the monitor, where the variation is between test and production builds — that one *is* a template parameter, `Orchestrator<MonitorT>`, because the choice is known at compile time.)
 
 ### 4.5 Executor
 
@@ -454,11 +453,18 @@ public:
     [[nodiscard]] size_t queued_count() const noexcept;
 
 private:
-    std::vector<std::jthread> workers_;
-    // Lock-free MPMC queue for task submission
-    ConcurrentQueue<std::move_only_function<void()>> task_queue_;
+    // Vyukov bounded MPMC ring: producers/consumers claim cells with one
+    // CAS each; a counting semaphore lets idle workers sleep (no spinning
+    // on battery/thermal-constrained hardware). Bounded on purpose:
+    // try_push rejection is backpressure, an unbounded queue is a slow OOM.
+    MpmcQueue<std::function<void(std::stop_token)>> task_queue_{QUEUE_CAPACITY};
+    std::counting_semaphore<> tasks_available_{0};
+    std::atomic<size_t> active_tasks_{0};
+    std::vector<std::jthread> workers_;  // declared last: destroyed (joined) first
 };
 ```
+
+Measured on a 16-core x86 host (`bench_queue`), the ring beats the previous mutex+`std::queue` hand-off by ~1.3× at 2×2 and 4×4 producers/consumers, loses slightly at 1×1 (an uncontended mutex is cheap), and ties at 8×8 — lock-free is a contention tool, not a universal win. Numbers on Pi-class hardware to follow with the benchmark suite.
 
 **Memory Pool (Arena Allocator):**
 
@@ -512,43 +518,44 @@ public:
 
 #### 4.6.1 Peer Discovery (`peer_discovery.hpp`)
 
-- **Mechanism:** UDP broadcast on a configurable port (default: 5200).
-- **Heartbeat:** Each node broadcasts a `NodeAdvertisement` every 2 seconds.
-- **Timeout:** Peers not heard from in 6 seconds (3 missed heartbeats) are marked unreachable.
+- **Mechanism:** UDP broadcast on the node port (default: 5201).
+- **Heartbeat:** Each node broadcasts a fixed 72-byte packed advertisement every 2 seconds.
+- **Timeout:** Peers not heard from in 6 seconds (3 missed heartbeats) are evicted.
+
+The discovery path deliberately does **not** use Protobuf: the advert is a
+fixed-size packed struct (`PeerDiscovery::AdvertPacket`) — magic `"EORC"`,
+protocol version, node id, TCP port, CPU/memory/thermal fields, flags.
+It is high-frequency, loss-tolerant, and never evolves per-field, so a
+parse-free fixed layout is cheaper and simpler. All multi-byte fields are
+big-endian on the wire (protocol v2; v1 sent host order and is rejected
+by the version check), floats travel as IEEE-754 bit patterns, and the
+field offsets are pinned by a layout test because they *are* the wire
+contract. The receiver records the sender's IP and advertised TCP port,
+which is how the offload client later resolves `node_id → endpoint`.
+
+#### 4.6.2 Transport (`transport.hpp`, `async_transport.hpp`, `reactor.hpp`)
+
+- **Protocol:** TCP carrying Protobuf-serialized `Envelope` messages.
+- **Framing:** 4-byte big-endian length prefix + serialized Envelope, 16 MB cap checked *before* allocation (a hostile length prefix cannot exhaust memory).
+- **Server:** `AsyncTransport` — C++20 coroutines over a single-threaded `epoll` reactor. Each accepted connection runs as a coroutine (`DetachedTask`) that parks on fd readiness (`co_await reactor.wait_readable(fd, deadline)`); handlers hop to a small worker pool so a slow workload submission never blocks the reactor or other peers' offload requests.
+- **Client:** the synchronous, `poll()`-based `TcpTransport`. Offload calls already run on executor worker threads that own the operation end-to-end, so coroutines would buy nothing there — async where concurrency pays (server fan-in), sync where a thread already owns the wait.
 
 ```cpp
-// Protobuf message
-message NodeAdvertisement {
-    string node_id = 1;
-    string address = 2;      // IP:port for TCP transport
-    uint32 tcp_port = 3;
-    ResourceSummary resources = 4;
-    uint64 timestamp_ms = 5;
+// Server side (per accepted connection, on the reactor):
+DetachedTask AsyncTransport::handle_connection(int fd) {
+    // read [4B length][Envelope], bounds-checked
+    if (co_await read_exact(fd, header, 4)) { ... }
+    co_await PoolHop{handler_pool_};        // handler off the reactor thread
+    auto response = handler_(payload);
+    co_await write_exact(fd, response...);  // back on the reactor for I/O
 }
 ```
 
-#### 4.6.2 Transport (`transport.hpp`)
+Serialization stays quarantined in `OffloadCodec` (one .cpp): the transport
+layers traffic in `std::vector<uint8_t>`, and no generated Protobuf header
+leaks into module interfaces.
 
-- **Protocol:** TCP with Protobuf-serialized messages.
-- **Async I/O:** C++20 coroutines wrapping `epoll` (Linux) for non-blocking send/receive.
-- **Framing:** Length-prefixed messages (4-byte big-endian size header + Protobuf payload).
-
-```cpp
-class AsyncTransport {
-public:
-    // Coroutine-based async operations
-    Task<void> connect(std::string_view address, uint16_t port);
-    Task<void> send(const google::protobuf::Message& msg);
-    Task<std::unique_ptr<google::protobuf::Message>> receive();
-    Task<void> close();
-
-private:
-    int socket_fd_;
-    // epoll integration for cooperative scheduling
-};
-```
-
-> **Note:** `Task<T>` here refers to a coroutine return type (C++20 coroutine handle wrapper), not a workload `Task`.
+> **Note:** `Async<T>`/`DetachedTask` (core/async.hpp) are coroutine return types, distinct from the workload `Task` struct.
 
 #### 4.6.3 Cluster View (`cluster_view.hpp`)
 
@@ -595,19 +602,19 @@ message ResourceSummary {
 }
 
 // Task offloading (TCP)
-message OffloadRequest {
-    string request_id = 1;
-    string task_id = 2;
-    string task_name = 3;
-    TaskProfile profile = 4;
-    bytes input_data = 5;
-}
-
-message TaskProfile {
+message TaskProfileMsg {
     uint64 compute_cost_us = 1;
     uint64 memory_bytes = 2;
     uint64 input_bytes = 3;
     uint64 output_bytes = 4;
+}
+
+message OffloadRequest {
+    string request_id = 1;   // reserved: correlation is per-connection today
+    string task_id = 2;
+    string task_name = 3;
+    TaskProfileMsg profile = 4;
+    bytes input_data = 5;
 }
 
 message OffloadResponse {
@@ -616,15 +623,48 @@ message OffloadResponse {
     bool success = 3;
     bytes output_data = 4;
     uint64 actual_duration_us = 5;
-    string error_message = 6;
+    uint64 peak_memory_bytes = 6;
+    string error_message = 7;
 }
 
-// Wrapper for multiplexing message types
+// Workload submission (TCP) — how external clients hand a DAG to a node.
+// tools/workload_injector.py speaks this from Python via the same .proto.
+message TaskSpec {
+    string task_id = 1;
+    string name = 2;
+    TaskProfileMsg profile = 3;
+    repeated string dependencies = 4;
+}
+
+message WorkloadSubmission {
+    string workload_id = 1;
+    repeated TaskSpec tasks = 2;
+}
+
+message WorkloadResult {
+    string workload_id = 1;
+    bool accepted = 2;
+    string error_message = 3;
+    uint64 local_tasks = 4;
+    uint64 offloaded_tasks = 5;
+    uint64 completed_tasks = 6;
+    uint64 failed_tasks = 7;
+    uint64 offload_fallbacks = 8;
+    uint64 makespan_estimate_us = 9;
+    uint64 total_duration_us = 10;
+}
+
+// Wrapper for multiplexing message types; the server dispatches on the
+// oneof case (Orchestrator::handle_message via OffloadCodec::classify).
 message Envelope {
     oneof payload {
-        NodeAdvertisement advertisement = 1;
+        NodeAdvertisement advertisement = 1;   // defined for future use;
+                                               // discovery uses the packed
+                                               // 72-byte UDP advert instead
         OffloadRequest offload_request = 2;
         OffloadResponse offload_response = 3;
+        WorkloadSubmission workload_submission = 4;
+        WorkloadResult workload_result = 5;
     }
 }
 ```
@@ -695,7 +735,7 @@ private:
 4. Initialize `ResourceMonitor` (or `MockResourceMonitor` in simulation mode).
 5. Initialize `ThreadPool` with configured thread count.
 6. Initialize `NetworkLayer` (peer discovery + TCP transport).
-7. Initialize `Scheduler` with configured policy variant.
+7. Initialize the scheduling policy from configuration (`create_policy()`).
 8. Register `SIGINT`/`SIGTERM` handlers for graceful shutdown via `std::jthread` stop tokens.
 9. Enter main loop: accept workload submissions, trigger scheduling, manage execution.
 
@@ -746,18 +786,19 @@ This section maps specific C++20 features to their usage locations, demonstratin
 
 | Feature | Module | Usage |
 |---------|--------|-------|
-| **Concepts** | `resource_monitor/`, `scheduler/` | `ResourceMonitorLike`, `SchedulingPolicyLike` — constrain template parameters for hot-path interfaces with zero virtual dispatch overhead |
-| **Coroutines** | `network/transport.hpp` | `Task<T>` coroutine type for async TCP send/receive, avoiding callback-heavy designs |
-| **`std::jthread`** | `executor/thread_pool.hpp`, `resource_monitor/` | Cooperative cancellation via `std::stop_token`; automatic join on destruction (RAII) |
-| **`std::format`** | `telemetry/`, `core/logger.hpp` | Type-safe string formatting for JSON event construction and diagnostic messages |
-| **Ranges & Views** | `workload/dag.hpp`, `scheduler/` | `std::views::filter`, `std::views::transform` for DAG traversal, filtering available nodes, sorting tasks by priority |
-| **`std::span`** | `network/`, `executor/` | Zero-copy views over serialized Protobuf buffers and memory pool regions |
-| **`std::expected`** | `core/result.hpp` | Monadic error handling (`Result<T, E>`) replacing exceptions in performance-critical paths |
-| **Designated Initializers** | `core/types.hpp`, `core/config.hpp` | Clean, self-documenting struct construction: `TaskProfile{.compute_cost = 1ms, .memory_bytes = 4096}` |
-| **`std::variant` + `std::visit`** | `scheduler/` | Runtime policy selection without virtual dispatch: `PolicyVariant` |
-| **Three-way Comparison (`<=>`)** | `workload/task.hpp` | Task priority ordering for scheduling queues |
-| **`constexpr` Extensions** | `core/types.hpp` | Compile-time computation of constants (e.g., default pool sizes, protocol magic numbers) |
-| **Structured Bindings** | Throughout | Idiomatic destructuring of pairs, tuples, and struct returns |
+| **Concepts** | `core/concepts.hpp` | `ResourceMonitorLike` (static_asserted by `Orchestrator<MonitorT>`), `SchedulingPolicyLike` (static_asserted in the policy tests) — enforced contracts, not decoration |
+| **Coroutines** | `core/async.hpp`, `network/reactor.*`, `network/async_transport.*` | `Async<T>` (lazy, symmetric transfer) and `DetachedTask` drive the epoll-based async offload server: one coroutine per connection |
+| **`std::jthread`** | `executor/`, `resource_monitor/`, `network/` | Cooperative cancellation via `std::stop_token`; automatic join on destruction (RAII) |
+| **`std::counting_semaphore`** | `executor/thread_pool.hpp` | Idle workers sleep on a semaphore gating the lock-free queue — no busy-waiting on battery-powered hardware |
+| **Atomics + `std::bit_ceil`** | `executor/mpmc_queue.hpp` | Vyukov bounded MPMC ring: per-cell sequence numbers, cache-line-aligned counters, power-of-two capacity |
+| **`std::atomic<std::shared_ptr>`** | `resource_monitor/` | Lock-free snapshot publication: single writer, many readers, no torn reads |
+| **`std::format`** | `workload/generator.cpp` | Type-safe construction of generated task identifiers |
+| **Designated Initializers** | Throughout | Clean, self-documenting struct construction: `TaskProfile{.compute_cost = 1ms, .memory_bytes = 4096}` |
+| **Three-way Comparison (`<=>`)** | `core/types.hpp`, `workload/dag.hpp` | Defaulted comparisons for `TaskProfile` and `Task` |
+| **`constexpr` Extensions** | `core/types.hpp` | Compile-time derived quantities (`memory_usage_percent`, `cpu_headroom_percent`) |
+| **`std::shared_mutex`** | `network/cluster_view.*`, `orchestrator/` | Many-reader cluster view; reader-tasks vs. writer-reset arena discipline |
+
+`Result<T, E>` (core/result.hpp) is a hand-rolled monadic result over `std::variant` — `std::expected` is C++23 and this project targets C++20; the type is designed to migrate to it mechanically.
 
 ---
 
@@ -767,17 +808,16 @@ This section maps specific C++20 features to their usage locations, demonstratin
 
 The project employs a deliberate hybrid approach:
 
-**Concepts (Compile-time, zero-cost)** — Used for interfaces on the hot path where performance matters and the set of implementations is known at compile time:
+**Concepts (Compile-time, zero-cost)** — Used where the implementation is chosen at compile time:
 
-- `ResourceMonitorLike` — Called every sampling interval; must be fast.
-- `SchedulingPolicyLike` — Called on every scheduling round; inner loops must be tight.
-- `SerializerLike` — Message serialization is invoked on every network send/receive.
+- `ResourceMonitorLike` — `Orchestrator<MonitorT>` is templated on the monitor (LinuxMonitor in production, MockMonitor in tests) and static_asserts the concept.
+- `SchedulingPolicyLike` — documents the policy contract; enforced by static_asserts in the test suite even though dispatch is virtual (see §4.4 for why).
 
 **Virtual Interfaces (Runtime, flexible)** — Used for configuration-time decisions and non-hot-path extensibility:
 
 - `ILogSink` — Log destinations are configured at startup and not changed during execution. Virtual dispatch cost is negligible relative to I/O.
-- `IConfigSource` — Configuration is read once at startup.
-- `IWorkloadSource` — Workload submission endpoint (could be Unix socket, HTTP, or stdin).
+- `ISchedulingPolicy` — the policy is chosen from TOML at startup (§4.4).
+- `AsyncTransport::MessageHandler` — the server's request handler is a `std::function`, bound once at `serve()`.
 
 This hybrid approach ensures maximum performance where it matters while maintaining clean extensibility points.
 
@@ -842,14 +882,30 @@ subject to:
 
 **Solution Method:** Since exact ILP/CP solving is too heavy for real-time embedded use, we implement a **fast heuristic**:
 
-1. Compute the critical path of the DAG.
-2. Assign critical-path tasks to minimize inter-node communication.
-3. Distribute remaining tasks using a bin-packing heuristic (First Fit Decreasing by compute cost).
-4. Apply local search (task swaps between nodes) for a configurable number of iterations.
+1. Compute the critical path of the DAG (longest-path DP over the topological order).
+2. Pin critical-path tasks to the local node: the most latency-sensitive chain pays zero transfer cost.
+3. Distribute remaining tasks using a bin-packing heuristic (First Fit Decreasing by compute cost, subject to per-node memory).
+4. Apply local search (random single-task moves between nodes, accepted when the estimated makespan improves) for a configurable number of iterations.
 
-**Complexity:** O(T × N × I) where I = max iterations of local search.  
-**Strengths:** Globally aware; considers communication costs; produces near-optimal plans.  
-**Weaknesses:** Higher computational overhead; requires tuning of iteration count.
+The makespan estimate used by the local search implements constraint (4)
+directly: a list schedule in topological order where each task starts when
+its dependencies' outputs have arrived (cross-node edges add
+`output_bytes × communication_weight`) and its node is free, with one
+execution slot per node (conservative on multi-core). This is what lets
+the optimizer recognize that a strictly sequential chain gains nothing
+from distribution — a property the earlier additive model missed — while
+still spreading genuinely parallel stages (see the fan-out comparison in
+`--demo`).
+
+**Simplifications vs. the published formulations:** no per-link bandwidth
+model (`communication_weight` is a single scalar), single execution slot
+per node, hill-climbing without escape from local optima, and a fixed
+RNG seed for reproducibility. Each is a deliberate cost/benefit cut for
+a sub-millisecond scheduling budget on Pi-class hardware.
+
+**Complexity:** O(T × N) setup + O((T + E) × I) local search, I = max iterations.  
+**Strengths:** Dependency-aware; considers communication costs; refuses useless distribution.  
+**Weaknesses:** Heuristic (no optimality bound); requires tuning of iteration count and the communication weight.
 
 ---
 
@@ -937,20 +993,21 @@ compute_per_layer_ms = 5
 
 ### Message Flow
 
-**Peer Discovery (UDP):**
+**Peer Discovery (UDP, packed 72-byte advert — not Protobuf):**
 
 ```
 Node A                    Network (broadcast)              Node B
   │                                                          │
-  ├──► NodeAdvertisement ──► [broadcast 255.255.255.255] ──► │
-  │    {id: "rpi-01",                                        │
-  │     address: "192.168.1.101",                            │
-  │     tcp_port: 5201,                                      │
-  │     resources: {...},                                    │
-  │     timestamp_ms: ...}                                   │
+  ├──► AdvertPacket ───────► [broadcast 255.255.255.255] ──► │
+  │    "EORC" v2 | node_id  |                                │
+  │    tcp_port | cpu% |                                     │
+  │    mem avail/total |                                     │
+  │    temp | flags   (all big-endian)                       │
   │                                                          │
-  │ ◄── NodeAdvertisement ◄── [broadcast] ◄──────────────────┤
-  │     {id: "rpi-02", ...}                                  │
+  │ ◄── AdvertPacket ◄────── [broadcast] ◄───────────────────┤
+  │                                                          │
+  │  (receiver also records the sender's IP: that plus       │
+  │   tcp_port is the endpoint used for offloading)          │
 ```
 
 **Task Offloading (TCP):**
@@ -973,7 +1030,7 @@ Node A (requester)                     Node B (executor)
 
 ### Wire Format
 
-All messages use a simple length-prefixed framing:
+All TCP messages use length-prefixed framing around a Protobuf Envelope:
 
 ```
 ┌──────────────┬──────────────────────────┐
@@ -982,6 +1039,12 @@ All messages use a simple length-prefixed framing:
 │  = N         │                          │
 └──────────────┴──────────────────────────┘
 ```
+
+N is validated against a 16 MB cap **before** the payload buffer is
+allocated (both transports), so a malicious length prefix cannot exhaust
+memory; truncated or malformed frames produce a clean error and a closed
+connection, never a crash. One request/response pair per connection —
+`request_id` exists in the schema for future pipelined transports.
 
 ---
 
@@ -1098,18 +1161,18 @@ jobs:
 
 ### Test Suite Summary
 
-**160 tests, all passing.** Total test time: ~9 seconds on a single machine.
+**178 tests, all passing.** Total test time: ~8 seconds on a single machine.
 
 | Test Target | Tests | Focus |
 |-------------|-------|-------|
 | `test_core` | 16 | `Result<T,E>` monadic operations, `ResourceSnapshot` helpers, TOML config parsing/defaults/errors |
-| `test_workload` | 27 | DAG construction, topological sort, cycle detection, critical path, 5 workload generators |
-| `test_executor` | 10 | Thread pool submission and concurrency, memory pool allocation/reset/OOM |
+| `test_workload` | 49 | DAG construction, topological sort, cycle detection, critical path, 5 workload generators |
+| `test_executor` | 15 | Thread pool submission and concurrency; memory pool allocation/reset/OOM; MPMC queue FIFO, full-rejection, wraparound, 4×4 stress |
 | `test_monitor` | 13 | LinuxMonitor (`/proc` parsing, threshold callbacks), MockMonitor (static + sequence modes) |
-| `test_scheduler` | 23 | All 3 policies, ClusterView helpers, cross-policy comparison |
-| `test_network` | 26 | ClusterViewManager (CRUD, thread safety), TCP round-trip (1MB messages), UDP discovery + eviction |
-| `test_orchestrator` | 15 | OffloadCodec round-trips, Orchestrator facade (start/stop, submit, policy selection) |
-| `test_integration` | 30 | Full pipeline (Monitor → Scheduler → Executor), two-node TCP offload, E2E orchestration |
+| `test_scheduler` | 22 | All 3 policies, ClusterView helpers, cross-policy comparison, makespan-model properties (chain vs fan-out), concept static_asserts |
+| `test_network` | 30 | ClusterViewManager (CRUD, thread safety), TCP round-trip (1MB messages), AsyncTransport (echo, concurrency, oversized-frame rejection), UDP discovery + eviction, advert layout pinning |
+| `test_orchestrator` | 22 | OffloadCodec round-trips, orchestrator-driven offload to a live peer, fallback on dead/dying peers, workload submission over TCP, arena reset regression |
+| `test_integration` | 11 | Full pipeline (Monitor → Scheduler → Executor), two-node TCP offload, E2E orchestration |
 
 ### Unit Tests (per module)
 
@@ -1138,11 +1201,10 @@ jobs:
 
 ### Benchmarks
 
-- **Scheduling overhead:** Time to produce a `SchedulingPlan` for DAGs of varying size (10–1000 tasks) across 1–8 nodes.
-- **Executor throughput:** Tasks per second under varying thread pool sizes.
-- **Network round-trip:** TCP offload request → response latency on localhost.
+- **`bench_scheduler`** — time to produce a `SchedulingPlan` for DAGs of varying size across varying cluster sizes, per policy: `./build/tests/bench_scheduler [--csv]`
+- **`bench_queue`** — lock-free MPMC ring vs. the previous mutex+`std::queue` hand-off under 1×1 … 8×8 producer/consumer contention: `./build/tests/bench_queue [ops]`
 
-Run benchmarks manually: `./build/bench_scheduler [--csv]`
+Planned (not yet implemented): executor task throughput and offload round-trip latency decomposition on Pi-class hardware.
 
 ---
 
@@ -1156,20 +1218,22 @@ Run benchmarks manually: `./build/bench_scheduler [--csv]`
 - [x] Workload model — DAG engine with 5 topology generators
 - [x] Three scheduling policies — Greedy, Threshold, Optimizer
 - [x] Thread pool executor with memory pool and task runner
-- [x] UDP peer discovery with heartbeat and eviction
-- [x] TCP transport with length-prefixed binary framing
-- [x] Thread-safe ClusterViewManager
-- [x] OffloadCodec binary serialization
-- [x] Orchestrator facade — template-parameterized, full lifecycle
-- [x] NDJSON telemetry with pluggable sinks
-- [x] Daemon application with TOML config, CLI args, `--demo` mode
-- [x] 160 unit + integration tests, all passing
+- [x] UDP peer discovery with heartbeat, eviction, and endian-safe v2 wire format
+- [x] TCP transport with length-prefixed framing and 16 MB pre-allocation cap
+- [x] Async offload server — C++20 coroutines over an epoll reactor, concurrent connections
+- [x] Protobuf Envelope wire protocol (offload + workload submission/result)
+- [x] End-to-end offloading: endpoint resolution from discovery, real TCP round trip, local fallback on peer death
+- [x] Workload submission over the wire (`tools/workload_injector.py` speaks the same .proto)
+- [x] Thread-safe ClusterViewManager with peer endpoint records
+- [x] Lock-free MPMC task queue with semaphore-gated workers (benchmarked vs mutex baseline)
+- [x] Orchestrator facade — template-parameterized, full lifecycle, single composition root for the daemon
+- [x] NDJSON telemetry with pluggable sinks; separate metrics stream in the daemon
+- [x] Daemon application with TOML config, CLI args, `--demo` mode (chain vs fan-out policy comparison)
+- [x] 178 unit + integration tests, all passing
 - [x] CMake build system with ARM64 cross-compilation toolchain
-- [x] GitHub Actions CI pipeline
+- [x] GitHub Actions CI pipeline (x86 Debug/Release, ASan+UBSan, ARM64 cross-compile)
 - [x] API reference documentation
 - [x] Comprehensive README with architecture diagrams
-
-**Stats:** 90 files, ~8,400 lines of C++20, 160 tests, 9 library targets
 
 ### v2.0 — Real Inference (Future)
 
@@ -1186,7 +1250,9 @@ Run benchmarks manually: `./build/bench_scheduler [--csv]`
 - [ ] Kubernetes-style health probes and liveness checks
 - [ ] Support for heterogeneous nodes (different ARM variants, x86 edge servers)
 - [ ] Energy-aware scheduling for battery-powered edge devices
-- [ ] Protobuf-based task offloading (replacing current binary codec)
+- [x] Protobuf-based task offloading (shipped in v1.x — replaced the original binary codec)
+- [ ] Authentication and transport security (mTLS on TCP, signed advertisements)
+- [ ] Partition/rejoin semantics for split-brain recovery
 
 ---
 

@@ -171,6 +171,16 @@ class OptimizerPolicy : public ISchedulingPolicy { OptimizerPolicy(OptimizerPoli
 ## Executor (`executor/`)
 
 ```cpp
+// Bounded lock-free MPMC ring (Vyukov); the ThreadPool's hand-off path
+template <typename T>
+class MpmcQueue {
+    explicit MpmcQueue(size_t capacity);   // rounded up to power of two
+    bool try_push(T&& value);              // false when full (backpressure)
+    bool try_pop(T& out);                  // false when empty
+    size_t size_approx() const;
+    size_t capacity() const;
+};
+
 class ThreadPool {
     explicit ThreadPool(size_t num_threads = 0);   // 0 = hardware_concurrency
 
@@ -233,14 +243,32 @@ class TcpTransport {
     void stop_serving();
 };
 
+class AsyncTransport {   // coroutine + epoll server; same wire contract as TcpTransport
+    explicit AsyncTransport(size_t handler_threads = 2, uint32_t io_timeout_ms = 10000);
+    Result<void> listen(uint16_t port, int backlog = 16);
+    void serve(MessageHandler handler);   // concurrent connections; handler runs off-reactor
+    void stop_serving();
+    size_t active_connections() const;
+};
+
 class ClusterViewManager {
-    void update_peer(const NodeId& id, ResourceSnapshot snapshot);
+    void update_peer(const NodeId& id, ResourceSnapshot snapshot);  // keeps known endpoint
+    void update_peer(const PeerInfo& info);                          // full record incl. endpoint
     void mark_unreachable(const NodeId& id);
     void remove_peer(const NodeId& id);
     ClusterView snapshot() const;
     std::vector<NodeId> available_peers() const;
     std::optional<ResourceSnapshot> peer_resources(const NodeId& id) const;
+    std::optional<PeerInfo> peer_info(const NodeId& id) const;       // node id -> endpoint
     size_t cluster_size() const;
+};
+
+struct PeerInfo {
+    NodeId node_id;
+    ResourceSnapshot resources;
+    std::string address;    // learned from the advert sender's IP
+    uint16_t tcp_port = 0;  // advertised offload port
+    bool reachable = true;
 };
 ```
 
@@ -250,12 +278,34 @@ class ClusterViewManager {
 struct OrchestrationResult {
     SchedulingPlan plan;
     size_t local_tasks, offloaded_tasks, completed_tasks, failed_tasks;
+    size_t offload_fallbacks;   // offloads that failed over to local execution
     Duration total_duration;
+};
+
+// OffloadCodec (orchestrator/): Protobuf Envelope encode/decode + dispatch
+struct OffloadCodec {
+    enum class WireKind { Unknown, OffloadRequest, OffloadResponse,
+                          WorkloadSubmission, WorkloadResult };
+    static WireKind classify(const std::vector<uint8_t>& data);
+    static std::vector<uint8_t> encode_request(...);
+    static bool decode_request(...);
+    static std::vector<uint8_t> encode_response(...);
+    static bool decode_response(...);
+    static std::vector<uint8_t> encode_submission(const std::string& workload_id,
+                                                   const WorkloadDAG& dag);
+    static bool decode_submission(const std::vector<uint8_t>&, std::string&, WorkloadDAG&);
+    static std::vector<uint8_t> encode_workload_result(...);
+    static bool decode_workload_result(...);
 };
 
 template <typename MonitorT = LinuxMonitor>
 class Orchestrator {
-    struct Options { Config config; std::unique_ptr<ILogSink> log_sink; LogLevel log_level; };
+    struct Options {
+        Config config;
+        std::unique_ptr<ILogSink> log_sink;
+        std::unique_ptr<ILogSink> metrics_sink;  // nullptr -> metrics discarded
+        LogLevel log_level;
+    };
 
     explicit Orchestrator(Options opts);
     Result<void> start();
@@ -297,7 +347,8 @@ struct Config {
     struct { NodeId id; uint16_t port; } node;
     struct { std::string policy; ThresholdPolicyConfig threshold; OptimizerPolicyConfig optimizer; } scheduler;
     struct { uint32_t sampling_interval_ms; } monitor;
-    struct { uint32_t heartbeat_interval_ms; uint32_t peer_timeout_ms; } network;
+    struct { uint32_t heartbeat_interval_ms; uint32_t peer_timeout_ms;
+             uint32_t offload_timeout_ms; } network;
     struct { uint32_t thread_count; uint32_t memory_pool_mb; } executor;
     struct { std::string log_dir; } telemetry;
 };

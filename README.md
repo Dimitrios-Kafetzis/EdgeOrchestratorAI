@@ -2,7 +2,7 @@
 
 [![CI](https://github.com/Dimitrios-Kafetzis/EdgeOrchestratorAI/actions/workflows/ci.yml/badge.svg)](https://github.com/Dimitrios-Kafetzis/EdgeOrchestratorAI/actions/workflows/ci.yml)
 [![C++20](https://img.shields.io/badge/C%2B%2B-20-blue.svg)](https://isocpp.org/std/the-standard)
-[![Tests](https://img.shields.io/badge/tests-160%20passing-brightgreen.svg)](#test-suite)
+[![Tests](https://img.shields.io/badge/tests-178%20passing-brightgreen.svg)](#test-suite)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
 **A distributed, adaptive resource orchestrator for dynamic AI workload scheduling across embedded Linux edge nodes, written in modern C++20.**
@@ -45,15 +45,17 @@ EdgeOrchestrator is a lightweight daemon designed for clusters of Raspberry Pi (
 - **9-module architecture** — Core, Resource Monitor, Workload, Scheduler, Executor, Network, Telemetry, Orchestrator facade, Application
 - **Three scheduling policies** — Greedy (weighted scoring), Threshold (adaptive offloading), Optimizer (critical path + bin packing + local search)
 - **Real Linux monitoring** — `/proc/stat`, `/proc/meminfo`, `/sys/class/thermal`, `/proc/net/dev`, RPi throttle detection
-- **UDP peer discovery** — 72-byte packed advertisement packets, configurable heartbeat and eviction timeout
-- **TCP task offloading** — Length-prefixed binary framing, custom OffloadCodec, non-blocking I/O with `poll()`
-- **Modern C++20** — Concepts, `std::jthread`, `std::atomic<shared_ptr>`, `Result<T,E>` monad, designated initializers, three-way comparison
-- **160 tests** — Unit, integration, and end-to-end tests covering all modules
+- **UDP peer discovery** — 72-byte packed advertisement packets (endian-safe, versioned), configurable heartbeat and eviction timeout
+- **TCP task offloading** — Protobuf `Envelope` protocol over length-prefixed framing; coroutine + `epoll` async server, `poll()`-based synchronous client; peer death fails over to local execution
+- **Workload submission over the wire** — clients (incl. the Python injector) submit whole DAGs via the same Protobuf schema and get executed results back
+- **Lock-free executor hand-off** — bounded Vyukov MPMC queue with semaphore-gated workers, benchmarked against the mutex baseline
+- **Modern C++20** — Concepts (enforced by static_assert), coroutines, `std::jthread`, `std::counting_semaphore`, `std::atomic<shared_ptr>`, `Result<T,E>` monad
+- **178 tests** — Unit, integration, and end-to-end tests covering all modules, including live two-node offload and failure-path coverage
 - **Cross-compilable** — CMake toolchain for `aarch64-linux-gnu`, CI via GitHub Actions
 
 ## Research Context
 
-This project is a practical realization of research on **dynamic partitioning and resource orchestration for AI model deployment in resource-constrained wireless edge networks**, conducted at the Athens University of Economics and Business under Professor Iordanis Koutsopoulos. The optimizer scheduling policy implements lightweight versions of partitioning formulations from published work on DNN and transformer inference across heterogeneous edge devices.
+This project is a practical realization of research on **dynamic partitioning and resource orchestration for AI model deployment in resource-constrained wireless edge networks**, conducted at the Athens University of Economics and Business under Professor Iordanis Koutsopoulos. The optimizer scheduling policy adapts the partitioning formulations from published work on DNN and transformer inference into a fast, dependency-aware heuristic — the simplifications and their rationale are documented in [docs/DESIGN.md](docs/DESIGN.md) §7.3.
 
 See [docs/research_context.md](docs/research_context.md) for full academic context and [docs/DESIGN.md](docs/DESIGN.md) for the comprehensive design document.
 
@@ -102,7 +104,7 @@ cmake --build build-arm -j$(nproc)
 ## Project Structure
 
 ```
-EdgeOrchestrator/                   90 files, ~8,400 lines of C++20
+EdgeOrchestrator/                   ~10,300 lines of C++20 across 77 tracked files
 ├── src/
 │   ├── core/                       Types, Result<T,E>, Config, Logger, Concepts
 │   │   ├── types.hpp               ResourceSnapshot, TaskProfile, Duration
