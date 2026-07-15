@@ -132,6 +132,7 @@ public:
     struct Options {
         Config config;
         std::unique_ptr<ILogSink> log_sink;
+        std::unique_ptr<ILogSink> metrics_sink;   ///< nullptr → metrics discarded
         LogLevel log_level = LogLevel::Info;
     };
 
@@ -224,7 +225,8 @@ Orchestrator<MonitorT>::Orchestrator(Options opts)
                  config_.node.port,
                  config_.network.heartbeat_interval_ms,
                  config_.network.peer_timeout_ms)
-    , metrics_(std::make_unique<NullSink>()) {
+    , metrics_(opts.metrics_sink ? std::move(opts.metrics_sink)
+                                 : std::make_unique<NullSink>()) {
 }
 
 template <typename MonitorT>

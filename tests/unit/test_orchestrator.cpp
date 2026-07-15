@@ -229,6 +229,7 @@ TEST(OffloadE2ETest, OrchestratorOffloadsToRealPeer) {
     Orchestrator<MockMonitor> orch({
         .config = config,
         .log_sink = std::make_unique<NullSink>(),
+        .metrics_sink = nullptr,
         .log_level = LogLevel::Debug
     });
 
@@ -275,6 +276,7 @@ TEST(OffloadE2ETest, OffloadFallsBackWhenPeerUnreachable) {
     Orchestrator<MockMonitor> orch({
         .config = config,
         .log_sink = std::make_unique<NullSink>(),
+        .metrics_sink = nullptr,
         .log_level = LogLevel::Debug
     });
 
@@ -356,6 +358,7 @@ TEST(WorkloadSubmissionTest, SubmitOverTcp) {
     Orchestrator<MockMonitor> orch({
         .config = config,
         .log_sink = std::make_unique<NullSink>(),
+        .metrics_sink = nullptr,
         .log_level = LogLevel::Debug
     });
     orch.monitor().set_cpu(20.0f);
@@ -426,6 +429,7 @@ TEST(OffloadE2ETest, OffloadFallsBackWhenPeerDiesMidTask) {
     Orchestrator<MockMonitor> orch({
         .config = config,
         .log_sink = std::make_unique<NullSink>(),
+        .metrics_sink = nullptr,
         .log_level = LogLevel::Debug
     });
     orch.monitor().set_cpu(95.0f);
@@ -472,6 +476,7 @@ TEST(WorkloadSubmissionTest, ArenaResetsBetweenWorkloads) {
     Orchestrator<MockMonitor> orch({
         .config = config,
         .log_sink = std::make_unique<NullSink>(),
+        .metrics_sink = nullptr,
         .log_level = LogLevel::Debug
     });
     orch.monitor().set_cpu(20.0f);
@@ -508,6 +513,7 @@ TEST(OrchestratorTest, ConstructWithMock) {
     Orchestrator<MockMonitor>::Options opts{
         .config = config,
         .log_sink = std::make_unique<NullSink>(),
+        .metrics_sink = nullptr,
         .log_level = LogLevel::Debug
     };
 
@@ -526,6 +532,7 @@ TEST(OrchestratorTest, StartAndStop) {
     Orchestrator<MockMonitor>::Options opts{
         .config = config,
         .log_sink = std::make_unique<NullSink>(),
+        .metrics_sink = nullptr,
         .log_level = LogLevel::Debug
     };
 
@@ -556,6 +563,7 @@ TEST(OrchestratorTest, SubmitLinearChain) {
     Orchestrator<MockMonitor>::Options opts{
         .config = config,
         .log_sink = std::make_unique<NullSink>(),
+        .metrics_sink = nullptr,
         .log_level = LogLevel::Debug
     };
 
@@ -593,6 +601,7 @@ TEST(OrchestratorTest, SubmitTransformerWorkload) {
     Orchestrator<MockMonitor>::Options opts{
         .config = config,
         .log_sink = std::make_unique<NullSink>(),
+        .metrics_sink = nullptr,
         .log_level = LogLevel::Debug
     };
 
@@ -625,6 +634,7 @@ TEST(OrchestratorTest, SubmitWithPeers) {
     Orchestrator<MockMonitor>::Options opts{
         .config = config,
         .log_sink = std::make_unique<NullSink>(),
+        .metrics_sink = nullptr,
         .log_level = LogLevel::Debug
     };
 
@@ -666,7 +676,9 @@ TEST(OrchestratorTest, PolicySelection) {
 
         Orchestrator<MockMonitor>::Options opts{
             .config = config,
-            .log_sink = std::make_unique<NullSink>()
+            .log_sink = std::make_unique<NullSink>(),
+            .metrics_sink = nullptr,
+            .log_level = LogLevel::Info
         };
 
         Orchestrator<MockMonitor> orch(std::move(opts));
