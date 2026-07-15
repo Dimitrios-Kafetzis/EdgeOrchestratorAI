@@ -8,7 +8,21 @@
  *   2. Accepting offloaded tasks from remote peers
  *   3. Monitoring cluster state and resource utilization
  *
- * Template-parameterized on MonitorT for testability (LinuxMonitor or MockMonitor).
+ * Template-parameterized on MonitorT for testability (LinuxMonitor or
+ * MockMonitor) — a compile-time seam instead of a virtual interface,
+ * because the monitor is the one dependency the tests must replace and
+ * its read() sits on paths where a vtable indirection would be pure
+ * cost. The concept check below turns a wrong MonitorT into a readable
+ * diagnostic rather than a template backtrace.
+ *
+ * Threading picture, since this class is where all the threads meet:
+ * discovery runs three of its own (broadcast/listen/evict), the monitor
+ * one, the reactor one plus its two handler-pool workers, the executor
+ * pool hardware_concurrency() by default, and resource_update_loop one
+ * more. Cross-thread state is confined to ClusterViewManager (locked),
+ * MetricsCollector (locked sink), the atomics in submit_workload, and
+ * the arena guarded by arena_mutex_ — everything else is thread-local
+ * by construction.
  */
 
 #pragma once
@@ -302,6 +316,28 @@ void Orchestrator<MonitorT>::stop() {
     logger_.info("Orchestrator stopped");
 }
 
+/**
+ * @brief Schedule a DAG, execute it (locally and via peers), gather counts.
+ *
+ * The flow is deliberately linear: fresh snapshot -> fresh cluster view
+ * -> plan -> fan the decisions out to the executor pool -> wait. The
+ * policy object is constructed per call (create_policy), which keeps
+ * policies stateless across workloads and makes the config hot-swappable
+ * in principle; at 10-900 us per schedule() the construction cost is
+ * noise.
+ *
+ * Offloaded tasks run their round trip on executor worker threads —
+ * the synchronous client blocks a worker for the duration, which is the
+ * accepted trade-off for keeping the client simple (see the note in
+ * async_transport.hpp). A broken round trip falls back to local
+ * execution right there on the same worker: the task must not be lost,
+ * and the fallback is invisible to the caller beyond the counter.
+ *
+ * The completion wait is a 30 s bounded poll, not a barrier: a task
+ * stuck past the deadline leaves completed+failed short of the plan
+ * size and shows up as failed work in the result rather than hanging
+ * the submitter forever.
+ */
 template <typename MonitorT>
 Result<OrchestrationResult> Orchestrator<MonitorT>::submit_workload(const WorkloadDAG& dag) {
     auto snap = monitor_.read();
@@ -414,6 +450,9 @@ Result<OrchestrationResult> Orchestrator<MonitorT>::submit_workload(const Worklo
     return result;
 }
 
+/// Policy name -> instance. Unknown names fall back to greedy rather
+/// than failing startup: a daemon with a typo'd config that still
+/// schedules beats a fleet node that silently refuses work.
 template <typename MonitorT>
 std::unique_ptr<ISchedulingPolicy> Orchestrator<MonitorT>::create_policy() const {
     if (config_.scheduler.policy == "threshold") {
