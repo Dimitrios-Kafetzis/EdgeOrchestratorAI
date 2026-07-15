@@ -196,6 +196,29 @@ void run_demo(const Config& config, Logger& logger) {
     logger.info("Optimizer: " + std::to_string(count_local(plan_o)) + " local, "
                 + std::to_string(plan_o.decisions.size() - count_local(plan_o)) + " offloaded, "
                 + "makespan " + std::to_string(plan_o.estimated_makespan.count()) + "us");
+    logger.info("(transformer layers are a sequential chain: distributing them "
+                "cannot beat the critical path, so keeping them local is correct)");
+
+    // Same comparison on a parallelizable topology, where distribution
+    // genuinely wins: 8 independent tasks between a fan-out and fan-in.
+    auto fan_dag = WorkloadGenerator::fan_out_fan_in(
+        8, TaskProfile{.compute_cost = Duration{4000}, .memory_bytes = 1024 * 1024});
+    auto fan_g = greedy.schedule(fan_dag, *snap, cluster_view);
+    auto fan_o = optimizer.schedule(fan_dag, *snap, cluster_view);
+
+    auto count_local_in = [&](const SchedulingPlan& plan) {
+        size_t local_count = 0;
+        for (const auto& d : plan.decisions)
+            if (d.assigned_node == config.node.id) ++local_count;
+        return local_count;
+    };
+    logger.info("Fan-out(8): greedy "
+                + std::to_string(count_local_in(fan_g)) + " local/"
+                + std::to_string(fan_g.decisions.size() - count_local_in(fan_g))
+                + " offloaded, makespan " + std::to_string(fan_g.estimated_makespan.count())
+                + "us; optimizer " + std::to_string(count_local_in(fan_o)) + " local/"
+                + std::to_string(fan_o.decisions.size() - count_local_in(fan_o))
+                + " offloaded, makespan " + std::to_string(fan_o.estimated_makespan.count()) + "us");
 
     // Execute the optimizer plan locally
     auto thread_count = config.executor.thread_count == 0
@@ -260,6 +283,14 @@ int main(int argc, char* argv[]) {
 
     auto daemon_sink = make_sink();
 
+    // Metrics get their own NDJSON stream (metrics_*.ndjson) so
+    // tools/log_analyzer.py can consume events without log noise.
+    std::unique_ptr<ILogSink> metrics_sink;
+    if (!config.telemetry.log_dir.empty()) {
+        metrics_sink = std::make_unique<JsonFileSink>(config.telemetry.log_dir,
+                                                      "metrics");
+    }
+
     // ── Orchestrator (single composition root) ──
     // The facade owns executor, monitor, discovery, offload server, and
     // telemetry, and serves offload requests and workload submissions on
@@ -267,6 +298,7 @@ int main(int argc, char* argv[]) {
     Orchestrator<LinuxMonitor> orchestrator({
         .config = config,
         .log_sink = std::move(daemon_sink),
+        .metrics_sink = std::move(metrics_sink),
         .log_level = LogLevel::Info
     });
 

@@ -21,7 +21,71 @@ using edge_orchestrator::SchedulingPolicyLike;
 static_assert(SchedulingPolicyLike<edge_orchestrator::GreedyPolicy>);
 static_assert(SchedulingPolicyLike<edge_orchestrator::ThresholdPolicy>);
 static_assert(SchedulingPolicyLike<edge_orchestrator::OptimizerPolicy>);
+
+edge_orchestrator::ResourceSnapshot make_node_snapshot(const std::string& id,
+                                                       float cpu) {
+    edge_orchestrator::ResourceSnapshot snap;
+    snap.node_id = id;
+    snap.cpu_usage_percent = cpu;
+    snap.memory_available_bytes = 4ULL * 1024 * 1024 * 1024;
+    snap.memory_total_bytes = 8ULL * 1024 * 1024 * 1024;
+    return snap;
+}
 }  // namespace
+
+// The dependency-aware makespan model must recognize that a strictly
+// sequential chain gains nothing from distribution: every cross-node
+// hop only adds transfer time on the critical path.
+TEST(OptimizerMakespanTest, SequentialChainStaysAtCriticalPath) {
+    using namespace edge_orchestrator;
+    TaskProfile profile{.compute_cost = Duration{2000},
+                        .memory_bytes = 1024,
+                        .output_bytes = 64 * 1024};
+    auto dag = WorkloadGenerator::linear_chain(10, profile);
+
+    ClusterView cluster;
+    cluster.peers.push_back({.node_id = "idle-peer",
+                             .resources = make_node_snapshot("idle-peer", 5.0f),
+                             .address = {},
+                             .tcp_port = 0,
+                             .reachable = true});
+
+    OptimizerPolicy optimizer(OptimizerPolicyConfig{});
+    auto plan = optimizer.schedule(dag, make_node_snapshot("local", 40.0f), cluster);
+
+    // Distribution cannot beat the chain's critical path.
+    EXPECT_GE(plan.estimated_makespan, dag.critical_path_cost());
+    // And the plan should not be worse than just running it all locally.
+    EXPECT_LE(plan.estimated_makespan, dag.total_compute_cost());
+}
+
+// Independent parallel work is where distribution genuinely wins: with
+// an idle peer, the optimizer must beat single-node execution.
+TEST(OptimizerMakespanTest, ParallelFanOutBeatsSingleNode) {
+    using namespace edge_orchestrator;
+    TaskProfile profile{.compute_cost = Duration{4000},
+                        .memory_bytes = 1024,
+                        .output_bytes = 1024};
+    auto dag = WorkloadGenerator::fan_out_fan_in(8, profile);
+
+    ClusterView cluster;
+    cluster.peers.push_back({.node_id = "idle-peer",
+                             .resources = make_node_snapshot("idle-peer", 5.0f),
+                             .address = {},
+                             .tcp_port = 0,
+                             .reachable = true});
+
+    OptimizerPolicy optimizer(OptimizerPolicyConfig{});
+    auto plan = optimizer.schedule(dag, make_node_snapshot("local", 40.0f), cluster);
+
+    size_t offloaded = 0;
+    for (const auto& d : plan.decisions) {
+        if (d.assigned_node != "local") ++offloaded;
+    }
+    EXPECT_GT(offloaded, 0u) << "an idle peer should attract parallel work";
+    EXPECT_LT(plan.estimated_makespan, dag.total_compute_cost())
+        << "distributing independent tasks must beat serial execution";
+}
 
 using namespace edge_orchestrator;
 

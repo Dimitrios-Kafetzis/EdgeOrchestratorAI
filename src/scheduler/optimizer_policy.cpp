@@ -52,45 +52,62 @@ struct NodeBudget {
 };
 
 /**
- * @brief Compute estimated makespan from current assignment.
- * Accounts for inter-node communication costs.
+ * @brief Dependency-aware makespan estimate for an assignment.
+ *
+ * A list schedule in topological order:
+ *   ready(t) = max over deps d of end(d), plus a transfer delay when d
+ *              ran on a different node (output_bytes × comm_weight)
+ *   start(t) = max(ready(t), the time its node frees up)
+ *   end(t)   = start(t) + compute(t)
+ * Makespan is the latest end time. Each node is modelled with a single
+ * execution slot — conservative on multi-core nodes, but it captures
+ * the property the previous model missed entirely: a dependency chain
+ * cannot finish faster than its critical path no matter how tasks are
+ * spread, so offloading a sequential workload only buys transfer cost.
+ *
+ * O(T + E) per call; the local search calls it once per iteration.
  */
-Duration estimate_makespan(const std::vector<NodeBudget>& nodes,
-                           const WorkloadDAG& dag,
+Duration estimate_makespan(const WorkloadDAG& dag,
+                           const std::vector<NodeBudget>& nodes,
                            const std::unordered_map<TaskId, size_t>& assignment,
                            float comm_weight) {
-    // For each node, compute the total time including communication delays
-    // Simple model: makespan = max over nodes of (compute + incoming transfer)
-    Duration max_time{0};
+    std::unordered_map<TaskId, int64_t> end_time;
+    std::vector<int64_t> node_free(nodes.size(), 0);
+    int64_t makespan = 0;
 
-    for (const auto& node : nodes) {
-        Duration node_time = node.assigned_compute;
+    for (const auto& task_id : dag.topological_order()) {
+        auto task = dag.get_task(task_id);
+        if (!task) continue;
+        auto assigned = assignment.find(task_id);
+        if (assigned == assignment.end()) continue;
+        size_t node = assigned->second;
 
-        // Add communication cost for tasks with remote dependencies
-        for (const auto& task_id : node.assigned_tasks) {
-            auto deps = dag.dependencies(task_id);
-            for (const auto& dep_id : deps) {
-                auto dep_it = assignment.find(dep_id);
-                auto task_it = assignment.find(task_id);
-                if (dep_it != assignment.end() && task_it != assignment.end()) {
-                    if (dep_it->second != task_it->second) {
-                        // Cross-node dependency — add transfer cost
-                        auto dep_task = dag.get_task(dep_id);
-                        if (dep_task) {
-                            auto transfer_us = static_cast<int64_t>(
-                                static_cast<float>(dep_task->profile.output_bytes) *
-                                comm_weight * 0.001f);  // Weighted transfer time
-                            node_time += Duration{transfer_us};
-                        }
-                    }
+        int64_t ready = 0;
+        for (const auto& dep_id : dag.dependencies(task_id)) {
+            auto dep_end = end_time.find(dep_id);
+            if (dep_end == end_time.end()) continue;
+            int64_t arrival = dep_end->second;
+
+            auto dep_assigned = assignment.find(dep_id);
+            if (dep_assigned != assignment.end() && dep_assigned->second != node) {
+                auto dep_task = dag.get_task(dep_id);
+                if (dep_task) {
+                    arrival += static_cast<int64_t>(
+                        static_cast<float>(dep_task->profile.output_bytes)
+                        * comm_weight * 0.001f);
                 }
             }
+            ready = std::max(ready, arrival);
         }
 
-        max_time = std::max(max_time, node_time);
+        int64_t start = std::max(ready, node_free[node]);
+        int64_t end = start + task->profile.compute_cost.count();
+        end_time[task_id] = end;
+        node_free[node] = end;
+        makespan = std::max(makespan, end);
     }
 
-    return max_time;
+    return Duration{makespan};
 }
 
 }  // anonymous namespace
@@ -330,7 +347,7 @@ void OptimizerPolicy::local_search_improve(
         nodes[idx].assigned_tasks.push_back(d.task_id);
     }
 
-    Duration current_makespan = estimate_makespan(nodes, dag, assignment, config_.communication_weight);
+    Duration current_makespan = estimate_makespan(dag, nodes, assignment, config_.communication_weight);
 
     // Iterative improvement: try random task swaps
     std::mt19937 rng(42);  // Deterministic for reproducibility
@@ -368,7 +385,7 @@ void OptimizerPolicy::local_search_improve(
 
         assignment[task_id] = to_node;
 
-        Duration new_makespan = estimate_makespan(nodes, dag, assignment, config_.communication_weight);
+        Duration new_makespan = estimate_makespan(dag, nodes, assignment, config_.communication_weight);
 
         if (new_makespan < current_makespan) {
             // Accept the swap
