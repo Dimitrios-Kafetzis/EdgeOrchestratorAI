@@ -32,6 +32,7 @@ gtest_discover_tests(test_workload)
 add_executable(test_executor
     unit/test_thread_pool.cpp
     unit/test_memory_pool.cpp
+    unit/test_mpmc_queue.cpp
 )
 target_link_libraries(test_executor PRIVATE eo_executor GTest::gtest_main)
 gtest_discover_tests(test_executor)
@@ -97,3 +98,8 @@ add_executable(bench_scheduler
     benchmark/bench_scheduler.cpp
 )
 target_link_libraries(bench_scheduler PRIVATE eo_orchestrator)
+
+add_executable(bench_queue
+    benchmark/bench_queue.cpp
+)
+target_link_libraries(bench_queue PRIVATE eo_executor)

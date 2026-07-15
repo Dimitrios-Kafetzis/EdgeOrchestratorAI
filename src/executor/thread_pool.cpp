@@ -1,6 +1,6 @@
 /**
  * @file thread_pool.cpp
- * @brief ThreadPool implementation.
+ * @brief ThreadPool implementation over the lock-free MPMC queue.
  * @author Dimitris Kafetzis
  */
 
@@ -23,32 +23,42 @@ ThreadPool::ThreadPool(size_t num_threads) {
 }
 
 ThreadPool::~ThreadPool() {
-    // Request stop on all jthreads first
     for (auto& worker : workers_) {
         worker.request_stop();
     }
-    // Wake all threads so they can observe the stop request
-    queue_cv_.notify_all();
-    // jthreads will auto-join in their destructors
+    // One permit per worker so every sleeper wakes and observes the stop.
+    tasks_available_.release(static_cast<std::ptrdiff_t>(workers_.size()));
+    // Join HERE, in the destructor body: waiting for jthread auto-join
+    // would destroy the semaphore and queue first (reverse member
+    // order), leaving workers racing against dead objects.
+    for (auto& worker : workers_) {
+        if (worker.joinable()) worker.join();
+    }
+}
+
+void ThreadPool::enqueue(TaskFn task) {
+    // The ring rejects when full; yielding here turns rejection into
+    // backpressure on the producer instead of unbounded memory growth.
+    while (!task_queue_.try_push(std::move(task))) {
+        std::this_thread::yield();
+    }
+    tasks_available_.release();
 }
 
 void ThreadPool::worker_loop(std::stop_token stop) {
-    while (!stop.stop_requested()) {
-        std::function<void(std::stop_token)> task;
-        {
-            std::unique_lock lock(queue_mutex_);
-            queue_cv_.wait(lock, stop, [this] { return !task_queue_.empty(); });
+    while (true) {
+        tasks_available_.acquire();
 
-            if (stop.stop_requested() && task_queue_.empty()) return;
-            if (task_queue_.empty()) continue;
-
-            task = std::move(task_queue_.front());
-            task_queue_.pop();
+        TaskFn task;
+        if (task_queue_.try_pop(task)) {
+            ++active_tasks_;
+            task(stop);
+            --active_tasks_;
+            continue;
         }
 
-        ++active_tasks_;
-        task(stop);
-        --active_tasks_;
+        // No task behind the permit: it was a shutdown wake-up.
+        if (stop.stop_requested()) return;
     }
 }
 
@@ -57,8 +67,7 @@ size_t ThreadPool::active_count() const noexcept {
 }
 
 size_t ThreadPool::queued_count() const noexcept {
-    std::lock_guard lock(queue_mutex_);
-    return task_queue_.size();
+    return task_queue_.size_approx();
 }
 
 size_t ThreadPool::thread_count() const noexcept {

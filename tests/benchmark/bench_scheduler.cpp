@@ -145,7 +145,8 @@ ClusterView make_cluster(size_t n) {
     ClusterView v;
     for (size_t i = 0; i < n; ++i) {
         auto id = "peer-" + std::to_string(i);
-        PeerInfo p{.node_id = id, .resources = make_snap(id, 20.0f + float(i) * 10), .reachable = true};
+        PeerInfo p{.node_id = id, .resources = make_snap(id, 20.0f + float(i) * 10),
+                   .address = "127.0.0.1", .tcp_port = 0, .reachable = true};
         v.peers.push_back(p);
     }
     return v;
