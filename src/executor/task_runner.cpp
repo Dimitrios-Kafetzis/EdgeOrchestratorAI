@@ -2,6 +2,15 @@
  * @file task_runner.cpp
  * @brief TaskRunner implementation with synthetic compute simulation.
  * @author Dimitris Kafetzis
+ *
+ * Tasks here are resource envelopes, not code: a task "runs" by
+ * claiming its declared memory from the arena and burning its declared
+ * compute_cost of real CPU time. That is exactly what the scheduling
+ * research needs — the policies care about how long tasks occupy a
+ * node's resources, not what they compute — and it keeps every
+ * benchmark reproducible because a 10 ms task costs 10 ms on any
+ * machine. Plugging in real inference later means swapping
+ * simulate_compute for a kernel invocation behind the same profile.
  */
 
 #include "executor/task_runner.hpp"
@@ -46,8 +55,17 @@ ExecutionResult TaskRunner::execute(const TaskId& task_id,
     };
 }
 
+/**
+ * @brief Burn CPU for the target duration, checking for cancellation.
+ *
+ * A busy loop rather than sleep_for on purpose: sleeping tasks would
+ * not contend for cores, and core contention is precisely the effect
+ * the resource monitor and the policies are supposed to observe. The
+ * inner 1000-iteration burst keeps the steady_clock and stop_token
+ * checks off the hot path while bounding cancellation latency to
+ * microseconds.
+ */
 void TaskRunner::simulate_compute(Duration target_duration, std::stop_token stop) {
-    // Busy-wait simulation calibrated to target duration
     auto start = std::chrono::steady_clock::now();
     volatile uint64_t counter = 0;
 

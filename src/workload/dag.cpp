@@ -47,6 +47,15 @@ void WorkloadDAG::add_dependency(const TaskId& from, const TaskId& to) {
 // Topological Ordering (Kahn's Algorithm)
 // ─────────────────────────────────────────────
 
+/**
+ * @brief Kahn's algorithm. O(V+E), allocation-heavy but cache-friendly.
+ *
+ * On a cyclic graph the returned order is shorter than task_count() —
+ * callers that must be cycle-safe (critical_path_cost,
+ * peak_memory_estimate) check exactly that and bail out with a zero,
+ * while schedulers may assume validated DAGs (submission paths call
+ * is_valid() first).
+ */
 std::vector<TaskId> WorkloadDAG::topological_order() const {
     std::unordered_map<TaskId, size_t> in_degree;
     for (const auto& [id, _] : tasks_) {
@@ -135,6 +144,14 @@ bool WorkloadDAG::is_valid() const {
     return !tasks_.empty() && !has_cycle();
 }
 
+/**
+ * @brief Three-color DFS with an explicit stack.
+ *
+ * Iterative on purpose: a 500-task chain is 500 recursion frames, and
+ * this runs inside the daemon on submission of untrusted DAGs — graph
+ * shape must not be able to blow the stack. Gray = on the current DFS
+ * path, so meeting a gray node is a back edge, i.e. a cycle.
+ */
 bool WorkloadDAG::has_cycle() const {
     enum class Color : uint8_t { White, Gray, Black };
     std::unordered_map<TaskId, Color> color;
@@ -267,6 +284,14 @@ Duration WorkloadDAG::critical_path_cost() const {
     return Duration{max_dist};
 }
 
+/**
+ * @brief Upper-bound memory estimate: sum per topological "level".
+ *
+ * Groups tasks by longest-distance-from-source and takes the largest
+ * per-level sum — i.e. it assumes everything that could run in parallel
+ * does. A real executor with fewer threads will stay below this bound,
+ * which is the right direction for an admission estimate to err.
+ */
 uint64_t WorkloadDAG::peak_memory_estimate() const {
     if (tasks_.empty()) return 0;
 

@@ -7,6 +7,30 @@
  * Sampling is performed by a dedicated std::jthread at a configurable
  * interval. The latest snapshot is published atomically for lock-free
  * reads by the scheduler.
+ *
+ * What is read, and how it becomes a number:
+ * - CPU %: /proc/stat jiffy counters, converted to a percentage as
+ *   active-delta / total-delta between consecutive samples. The first
+ *   sample therefore measures "since start()", not "since boot" —
+ *   start() primes the previous counters for exactly that reason.
+ *   iowait counts as idle (a core waiting on the SD card is schedulable),
+ *   steal counts as active (someone else is using it).
+ * - Memory: MemAvailable from /proc/meminfo, not MemFree — the kernel's
+ *   own estimate of what could be claimed without swapping, which is
+ *   the number an admission decision actually needs.
+ * - Temperature: /sys/class/thermal millidegrees / 1000.
+ * - Network: /proc/net/dev byte counters minus the previous sample,
+ *   divided by the interval → bytes/sec, all interfaces except lo.
+ * - Throttling: bit 2 of the RPi firmware's get_throttled ("currently
+ *   throttled"), not bit 0 (undervoltage) or the sticky history bits.
+ *
+ * Every parse degrades to a zero/false on absent or malformed files, so
+ * the same binary runs on a Pi, a laptop, and a CI container — the
+ * snapshot just carries fewer live fields.
+ *
+ * The measured cost of one full sample_once() is ~0.2 ms of CPU on a
+ * Pi 4; at the default 500 ms interval the whole idle daemon sits at
+ * 0.23 % of one core (docs/BENCHMARKS.md §4).
  */
 
 #include "resource_monitor/monitor.hpp"
@@ -181,6 +205,9 @@ void LinuxMonitor::stop() {
     }
 }
 
+/// Lock-free: returns the latest published snapshot (shared_ptr swap).
+/// Costs ~0.2 µs — callers may poll it as often as they like; freshness
+/// is bounded by the sampling interval, not by read().
 Result<ResourceSnapshot> LinuxMonitor::read() {
     auto snapshot = latest_.load();
     if (!snapshot) {
