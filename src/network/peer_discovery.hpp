@@ -28,8 +28,28 @@ using PeerCallback = std::function<void(const PeerInfo&)>;
 
 class PeerDiscovery {
 public:
+    /**
+     * @brief Construct a discovery agent for this node.
+     *
+     * @param node_id                Identity advertised to peers (max 31 chars
+     *                               on the wire; longer ids are truncated).
+     * @param tcp_port               The node's offload/submission TCP port.
+     *                               Travels inside the advert so peers know
+     *                               where to connect; discovery itself never
+     *                               uses it.
+     * @param discovery_port         UDP port heartbeats are broadcast to and
+     *                               received on. All nodes of one cluster must
+     *                               agree on it; several daemons on one host
+     *                               can share it (SO_REUSEADDR — broadcast
+     *                               datagrams are delivered to every bound
+     *                               socket), which is what makes single-machine
+     *                               multi-node clusters work.
+     * @param heartbeat_interval_ms  Advert period.
+     * @param peer_timeout_ms        Silence after which a peer is evicted.
+     */
     PeerDiscovery(NodeId node_id,
-                  uint16_t port,
+                  uint16_t tcp_port,
+                  uint16_t discovery_port,
                   uint32_t heartbeat_interval_ms,
                   uint32_t peer_timeout_ms);
     ~PeerDiscovery();
@@ -87,7 +107,8 @@ private:
     void notify_lost(const PeerInfo& peer);
 
     NodeId node_id_;
-    uint16_t port_;
+    uint16_t tcp_port_;        ///< Advertised in packets; not bound here
+    uint16_t discovery_port_;  ///< UDP port for broadcast + listen
     uint32_t heartbeat_interval_ms_;
     uint32_t peer_timeout_ms_;
 

@@ -230,7 +230,9 @@ fresher signals.
 
 Two-node cluster (Pi + workstation daemons over the WLAN), 2 s
 heartbeat / 6 s eviction timeout. Symmetric random drop applied to the
-discovery datagrams (UDP 5201, both directions) at the Pi via
+discovery datagrams (UDP 5201 — at the benchmarked commit discovery
+shared the TCP port number; it has since moved to its own
+`discovery_port`, 5200 by default) at the Pi via
 `iptables -m statistic`; 3 min clean baseline, then 5 min per loss
 level. "Spurious eviction" = a `Peer lost` on either daemon while both
 were in fact alive.
@@ -374,7 +376,7 @@ cmake --build build -j$(nproc)
 
 Discovery/partition experiments (§5–6) run two daemons
 (`edge_orchestrator --node-id A` / `--node-id B` on two machines,
-same `node.port`) with loss injected via
-`iptables -I INPUT/OUTPUT -p udp --dport 5201 -m statistic --mode random
+same `discovery_port`) with loss injected via
+`iptables -I INPUT/OUTPUT -p udp --dport 5200 -m statistic --mode random
 --probability 0.3 -j DROP`, and workloads injected via
 `tools/workload_injector.py`.

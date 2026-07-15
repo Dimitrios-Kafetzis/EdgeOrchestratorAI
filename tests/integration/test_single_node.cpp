@@ -274,8 +274,8 @@ TEST(TwoNodeIntegration, TcpOffloadRoundTrip) {
 TEST(TwoNodeIntegration, DiscoveryAndClusterViewUpdate) {
     ClusterViewManager cluster_mgr;
 
-    PeerDiscovery disc_a("node-alpha", 19951, 200, 2000);
-    PeerDiscovery disc_b("node-beta", 19951, 200, 2000);
+    PeerDiscovery disc_a("node-alpha", 20451, 19951, 200, 2000);
+    PeerDiscovery disc_b("node-beta", 20451, 19951, 200, 2000);
 
     ResourceSnapshot snap_a;
     snap_a.cpu_usage_percent = 30.0f;

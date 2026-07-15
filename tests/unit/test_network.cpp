@@ -469,7 +469,7 @@ TEST(AsyncTransportTest, OversizedFrameClosedWithoutResponse) {
 // ═══════════════════════════════════════════════
 
 TEST(PeerDiscoveryTest, Construction) {
-    PeerDiscovery discovery("test-node", 15200, 1000, 3000);
+    PeerDiscovery discovery("test-node", 15700, 15200, 1000, 3000);
     EXPECT_EQ(discovery.known_peer_count(), 0u);
 }
 
@@ -493,7 +493,7 @@ TEST(PeerDiscoveryTest, AdvertPacketLayout) {
 }
 
 TEST(PeerDiscoveryTest, UpdateLocalResources) {
-    PeerDiscovery discovery("test-node", 15200, 1000, 3000);
+    PeerDiscovery discovery("test-node", 15700, 15200, 1000, 3000);
 
     ResourceSnapshot snap;
     snap.cpu_usage_percent = 75.0f;
@@ -505,7 +505,7 @@ TEST(PeerDiscoveryTest, UpdateLocalResources) {
 }
 
 TEST(PeerDiscoveryTest, CallbackRegistration) {
-    PeerDiscovery discovery("test-node", 15200, 1000, 3000);
+    PeerDiscovery discovery("test-node", 15700, 15200, 1000, 3000);
 
     bool discovered = false;
     bool lost = false;
@@ -521,8 +521,8 @@ TEST(PeerDiscoveryTest, CallbackRegistration) {
 TEST(PeerDiscoveryTest, SelfDiscoveryFiltered) {
     // Two discoveries on the same port — they should hear each other
     // but filter their own broadcasts
-    PeerDiscovery disc1("node-A", 15201, 200, 2000);
-    PeerDiscovery disc2("node-B", 15201, 200, 2000);
+    PeerDiscovery disc1("node-A", 15701, 15201, 200, 2000);
+    PeerDiscovery disc2("node-B", 15701, 15201, 200, 2000);
 
     bool a_found_b = false;
     bool b_found_a = false;
@@ -557,8 +557,8 @@ TEST(PeerDiscoveryTest, SelfDiscoveryFiltered) {
 TEST(PeerDiscoveryTest, PeerEviction) {
     // disc1 broadcasts, disc2 listens. When disc1 stops, disc2 should
     // eventually evict it.
-    PeerDiscovery disc1("node-fast", 15202, 100, 500);
-    PeerDiscovery disc2("node-watcher", 15202, 100, 400);  // Short timeout
+    PeerDiscovery disc1("node-fast", 15702, 15202, 100, 500);
+    PeerDiscovery disc2("node-watcher", 15702, 15202, 100, 400);  // Short timeout
 
     bool peer_lost = false;
     std::string lost_id;
@@ -589,8 +589,8 @@ TEST(PeerDiscoveryTest, PeerEviction) {
 }
 
 TEST(PeerDiscoveryTest, ResourcesInAdvertisement) {
-    PeerDiscovery disc1("node-sender", 15203, 200, 2000);
-    PeerDiscovery disc2("node-receiver", 15203, 200, 2000);
+    PeerDiscovery disc1("node-sender", 15703, 15203, 200, 2000);
+    PeerDiscovery disc2("node-receiver", 15703, 15203, 200, 2000);
 
     // Set specific resource values on disc1
     ResourceSnapshot snap;
@@ -604,12 +604,14 @@ TEST(PeerDiscoveryTest, ResourcesInAdvertisement) {
     float received_cpu = 0.0f;
     uint64_t received_mem = 0;
     bool received_throttled = false;
+    uint16_t received_tcp_port = 0;
 
     disc2.on_peer_discovered([&](const PeerInfo& peer) {
         if (peer.node_id == "node-sender") {
             received_cpu = peer.resources.cpu_usage_percent;
             received_mem = peer.resources.memory_available_bytes;
             received_throttled = peer.resources.is_throttled;
+            received_tcp_port = peer.tcp_port;
         }
     });
 
@@ -625,4 +627,9 @@ TEST(PeerDiscoveryTest, ResourcesInAdvertisement) {
     EXPECT_FLOAT_EQ(received_cpu, 42.5f);
     EXPECT_EQ(received_mem, 1234567890ULL);
     EXPECT_TRUE(received_throttled);
+
+    // The advert must carry the TCP port, not the discovery port the
+    // packet arrived on — that is what makes the two independently
+    // configurable.
+    EXPECT_EQ(received_tcp_port, 15703u);
 }

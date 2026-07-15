@@ -223,6 +223,7 @@ Orchestrator<MonitorT>::Orchestrator(Options opts)
     , memory_pool_(static_cast<size_t>(config_.executor.memory_pool_mb) * 1024 * 1024)
     , discovery_(config_.node.id,
                  config_.node.port,
+                 config_.node.discovery_port,
                  config_.network.heartbeat_interval_ms,
                  config_.network.peer_timeout_ms)
     , metrics_(opts.metrics_sink ? std::move(opts.metrics_sink)

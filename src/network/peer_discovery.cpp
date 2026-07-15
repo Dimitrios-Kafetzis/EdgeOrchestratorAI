@@ -4,8 +4,10 @@
  * @author Dimitris Kafetzis
  *
  * Uses SO_BROADCAST for heartbeat advertisements on the local subnet.
- * Listens for peer adverts on the same port. A separate eviction thread
- * removes peers that haven't been heard from within the timeout.
+ * Broadcasts and listens on the dedicated discovery port; the node's TCP
+ * port travels inside the advert so peers learn where to offload without
+ * the two sockets ever sharing a port. A separate eviction thread removes
+ * peers that haven't been heard from within the timeout.
  */
 
 #include "network/peer_discovery.hpp"
@@ -64,11 +66,13 @@ int create_udp_socket(bool enable_broadcast) {
 // ─────────────────────────────────────────────
 
 PeerDiscovery::PeerDiscovery(NodeId node_id,
-                              uint16_t port,
+                              uint16_t tcp_port,
+                              uint16_t discovery_port,
                               uint32_t heartbeat_interval_ms,
                               uint32_t peer_timeout_ms)
     : node_id_(std::move(node_id))
-    , port_(port)
+    , tcp_port_(tcp_port)
+    , discovery_port_(discovery_port)
     , heartbeat_interval_ms_(heartbeat_interval_ms)
     , peer_timeout_ms_(peer_timeout_ms) {
     local_resources_.node_id = node_id_;
@@ -97,7 +101,7 @@ void PeerDiscovery::start() {
 
     sockaddr_in bind_addr{};
     bind_addr.sin_family = AF_INET;
-    bind_addr.sin_port = htons(port_);
+    bind_addr.sin_port = htons(discovery_port_);
     bind_addr.sin_addr.s_addr = INADDR_ANY;
 
     if (::bind(listen_fd_, reinterpret_cast<sockaddr*>(&bind_addr), sizeof(bind_addr)) < 0) {
@@ -161,7 +165,7 @@ size_t PeerDiscovery::known_peer_count() const {
 void PeerDiscovery::broadcast_loop(std::stop_token stop) {
     sockaddr_in dest{};
     dest.sin_family = AF_INET;
-    dest.sin_port = htons(port_);
+    dest.sin_port = htons(discovery_port_);
     dest.sin_addr.s_addr = INADDR_BROADCAST;
 
     while (!stop.stop_requested()) {
@@ -295,7 +299,7 @@ PeerDiscovery::AdvertPacket PeerDiscovery::build_advert() const {
     auto copy_len = std::min(node_id_.size(), sizeof(pkt.node_id) - 1);
     std::memcpy(pkt.node_id, node_id_.data(), copy_len);
 
-    pkt.tcp_port_be = htobe16(port_);
+    pkt.tcp_port_be = htobe16(tcp_port_);
 
     // Snapshot local resources
     {
