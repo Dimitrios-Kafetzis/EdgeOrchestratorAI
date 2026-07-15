@@ -161,12 +161,12 @@ std::vector<BenchResult> bench_dag() {
     constexpr size_t N = 1000;
     TaskProfile pr{.compute_cost = Duration{1000}, .memory_bytes = 4096};
 
-    for (size_t n : {10, 50, 100, 200})
+    for (size_t n : {10u, 50u, 100u, 200u})
         R.push_back(run_bench("linear_chain(" + std::to_string(n) + ")", "DAG Generation", N,
             [&]{ auto d = WorkloadGenerator::linear_chain(n, pr); (void)d; },
             std::to_string(n) + " tasks"));
 
-    for (size_t L : {4, 12, 24, 48})
+    for (size_t L : {4u, 12u, 24u, 48u})
         R.push_back(run_bench("transformer(" + std::to_string(L) + "L)", "DAG Generation", N,
             [&]{ auto d = WorkloadGenerator::transformer_layers(L, 768, 2048); (void)d; },
             std::to_string(L * 2) + " tasks"));
@@ -192,7 +192,7 @@ std::vector<BenchResult> bench_scheduling() {
     ClusterView empty;
     TaskProfile pr{.compute_cost = Duration{1000}, .memory_bytes = 4096};
 
-    for (size_t n : {10, 50, 100}) {
+    for (size_t n : {10u, 50u, 100u}) {
         auto dag = WorkloadGenerator::linear_chain(n, pr);
         auto label = std::to_string(n) + "T, 0 peers";
 
@@ -204,7 +204,7 @@ std::vector<BenchResult> bench_scheduling() {
             [&]{ OptimizerPolicy p({}); auto r = p.schedule(dag, snap, empty); (void)r; }, label));
     }
 
-    for (size_t peers : {1, 3, 5}) {
+    for (size_t peers : {1u, 3u, 5u}) {
         auto cluster = make_cluster(peers);
         auto dag = WorkloadGenerator::transformer_layers(12, 768, 2048);
         auto label = "24T, " + std::to_string(peers) + " peers";
