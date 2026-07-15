@@ -2,6 +2,14 @@
  * @file async_transport.cpp
  * @brief AsyncTransport implementation.
  * @author Dimitris Kafetzis
+ *
+ * Each accepted connection becomes one coroutine (handle_connection).
+ * The coroutine's socket awaits park it on the reactor thread; the user
+ * handler runs on a small dedicated pool via PoolHop, never on the
+ * reactor — so a handler that takes seconds (a whole workload
+ * submission) can't starve other connections' I/O. Frames are the same
+ * [4B BE length][payload] contract as TcpTransport, so the synchronous
+ * client and this server interoperate byte-for-byte.
  */
 
 #include "network/async_transport.hpp"
@@ -104,6 +112,13 @@ void AsyncTransport::stop_serving() {
     }
 }
 
+/**
+ * @brief Accept coroutine: parks on the listening fd, drains accept4.
+ *
+ * accept4 is drained in a loop because one readiness event can cover
+ * several queued connections (level-triggered epoll would re-report,
+ * but the reactor arms EPOLLONESHOT, so we must not leave any behind).
+ */
 DetachedTask AsyncTransport::accept_loop() {
     while (!stopping_) {
         bool ready = co_await reactor_.wait_readable(server_fd_, 500);
@@ -123,6 +138,16 @@ DetachedTask AsyncTransport::accept_loop() {
     }
 }
 
+/**
+ * @brief Per-connection coroutine: one request, one response, close.
+ *
+ * The single-exchange lifecycle is deliberate: offload clients connect
+ * per task (see Orchestrator::offload_to_peer), so connection reuse
+ * would buy nothing and would complicate framing errors — any parse or
+ * I/O failure here simply drops the connection, and the client maps
+ * that to its own timeout/fallback path. active_connections_ brackets
+ * the whole body so stop_serving can wait for in-flight exchanges.
+ */
 DetachedTask AsyncTransport::handle_connection(int fd) {
     active_connections_.fetch_add(1);
 
@@ -152,6 +177,14 @@ DetachedTask AsyncTransport::handle_connection(int fd) {
     active_connections_.fetch_sub(1);
 }
 
+/**
+ * @brief Read exactly len bytes from a non-blocking socket.
+ *
+ * Fast path first: recv until EAGAIN, then park on the reactor. A
+ * false return collapses peer-close, hard errors, timeout, and
+ * reactor shutdown into one outcome — the caller closes the
+ * connection in all of them, so distinguishing would be decoration.
+ */
 Async<bool> AsyncTransport::read_exact(int fd, void* buf, size_t len) {
     size_t done = 0;
     auto* p = static_cast<uint8_t*>(buf);
@@ -170,6 +203,8 @@ Async<bool> AsyncTransport::read_exact(int fd, void* buf, size_t len) {
     co_return true;
 }
 
+/// Mirror of read_exact for the send side. MSG_NOSIGNAL because a
+/// dying peer must produce EPIPE, not SIGPIPE, in a multithreaded daemon.
 Async<bool> AsyncTransport::write_exact(int fd, const void* buf, size_t len) {
     size_t done = 0;
     const auto* p = static_cast<const uint8_t*>(buf);

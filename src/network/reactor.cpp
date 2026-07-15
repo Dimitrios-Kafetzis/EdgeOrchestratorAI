@@ -2,6 +2,25 @@
  * @file reactor.cpp
  * @brief EpollReactor implementation.
  * @author Dimitris Kafetzis
+ *
+ * One thread, one epoll instance, one parked coroutine per fd. The
+ * model is deliberately narrower than a general-purpose event loop:
+ *
+ * - Registrations use EPOLLONESHOT, so an fd is armed for exactly one
+ *   readiness event and then removed. The awaiting coroutine re-arms by
+ *   awaiting again. This sidesteps the classic epoll hazards (stale
+ *   events after close, spurious wakeups resuming a dead handle) at the
+ *   cost of one epoll_ctl per await — negligible next to the socket I/O
+ *   it guards.
+ * - Timeouts are per-waiter deadlines, not epoll timers. The loop's
+ *   epoll_wait timeout is simply the nearest deadline (capped at 500 ms
+ *   so stop requests stay responsive), and an eventfd wakes the loop
+ *   early whenever a new waiter registers with a nearer deadline.
+ * - A waiter resumes in exactly one of three ways, and always exactly
+ *   once: readiness (ready_ = true), deadline expiry (ready_ = false),
+ *   or reactor shutdown (ready_ = false, via the drain loop below).
+ *   Callers can't tell timeout from shutdown apart — both mean "your
+ *   I/O did not happen", which is all a connection handler needs.
  */
 
 #include "network/reactor.hpp"
@@ -68,6 +87,15 @@ FdAwaiter EpollReactor::wait_writable(int fd, uint32_t timeout_ms) {
     return FdAwaiter{*this, fd, EPOLLOUT, timeout_ms};
 }
 
+/**
+ * @brief Park a coroutine until its fd is ready or its deadline passes.
+ *
+ * Called from await_suspend, i.e. on whatever thread the coroutine was
+ * running on — not necessarily the reactor thread, hence the lock.
+ * Returns false (don't suspend) when the reactor is shutting down or
+ * epoll rejects the fd; the coroutine then continues inline and sees
+ * ready_ == false.
+ */
 bool EpollReactor::register_waiter(FdAwaiter* awaiter,
                                    std::coroutine_handle<> handle) {
     {
@@ -104,6 +132,14 @@ void EpollReactor::wake() {
     }
 }
 
+/**
+ * @brief The reactor loop: wait, resume ready waiters, expire deadlines.
+ *
+ * Resumptions happen outside the lock because a resumed coroutine
+ * usually runs straight to its next co_await, which re-enters
+ * register_waiter on this same thread — holding the lock across the
+ * resume would deadlock immediately.
+ */
 void EpollReactor::run(std::stop_token stop) {
     constexpr int MAX_EVENTS = 32;
     epoll_event events[MAX_EVENTS];

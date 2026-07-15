@@ -5,6 +5,14 @@
  *
  * Wire format: [uint32_t big-endian length][payload bytes]
  * Uses poll() for non-blocking I/O with timeouts.
+ *
+ * This is the synchronous half of the transport story. The offload
+ * client lives on an executor worker thread that owns the whole
+ * operation start-to-finish, so blocking-with-deadline is the natural
+ * shape there; the async coroutine machinery (AsyncTransport) is
+ * reserved for the server side, where one slow peer must not block
+ * another. Both speak the identical frame format, which is what the
+ * integration tests exercise across a real socket pair.
  */
 
 #include "network/transport.hpp"
@@ -72,6 +80,15 @@ TcpTransport::~TcpTransport() {
 // Client Side
 // ─────────────────────────────────────────────
 
+/**
+ * @brief Connect with a hard deadline.
+ *
+ * The socket is non-blocking from birth, so ::connect returns
+ * EINPROGRESS and the deadline is enforced by poll(POLLOUT) rather
+ * than by fiddling with SO_SNDTIMEO. POLLOUT alone does not mean
+ * success — a refused connection is also "writable" — hence the
+ * SO_ERROR check afterwards.
+ */
 Result<void> TcpTransport::connect(const std::string& address, uint16_t port,
                                     uint32_t timeout_ms) {
     if (client_fd_ >= 0) {
@@ -209,8 +226,12 @@ void TcpTransport::serve(MessageHandler handler) {
 
             configure_socket(client_fd);
 
-            // Handle the connection (single-threaded for simplicity;
-            // could be extended to a thread pool)
+            // One connection at a time, on this thread. That is a real
+            // throughput limit, and it is deliberate: this server exists
+            // for tests and tools. The daemon serves offloads through
+            // AsyncTransport, which multiplexes; keeping this one dumb
+            // means there is exactly one concurrent server to reason
+            // about in production.
             auto request = recv_on_fd(client_fd, 10000);
             if (request.has_value()) {
                 auto response = handler(*request);
@@ -296,6 +317,14 @@ Result<std::vector<uint8_t>> TcpTransport::recv_on_fd(int fd, uint32_t timeout_m
     return payload;
 }
 
+/**
+ * @brief Loop until every byte is written or the deadline passes.
+ *
+ * The timeout is per poll() round, not a total budget — a peer that
+ * trickles one byte per interval can stretch the wall time. Acceptable
+ * here because frames are small (1 MiB cap via config, 16 MiB hard cap)
+ * and the caller layers its own end-to-end timeout on top.
+ */
 bool TcpTransport::send_all(int fd, const void* buf, size_t len, uint32_t timeout_ms) {
     const auto* ptr = static_cast<const uint8_t*>(buf);
     size_t remaining = len;

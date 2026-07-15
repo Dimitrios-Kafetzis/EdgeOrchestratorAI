@@ -2,6 +2,15 @@
  * @file cluster_view.cpp
  * @brief ClusterViewManager implementation.
  * @author Dimitris Kafetzis
+ *
+ * The manager is the single mutable home of peer state; everything a
+ * scheduler ever sees is an immutable ClusterView copied out under a
+ * shared lock. Copying is the concurrency strategy: discovery threads
+ * write rarely (every heartbeat), schedulers read a snapshot and then
+ * work on it lock-free for the whole scheduling pass. A shared_mutex
+ * fits that read-mostly profile; peers number in the tens, so the copy
+ * costs less than a microsecond (measured in bench_scheduler,
+ * cluster_snapshot(10) ≈ 0.7 µs on a Pi 4).
  */
 
 #include "network/cluster_view.hpp"
@@ -41,6 +50,13 @@ void ClusterViewManager::clear() {
     peers_.clear();
 }
 
+/**
+ * @brief Copy out the reachable peers as an immutable view.
+ *
+ * Unreachable peers are filtered here, not at the call sites, so a
+ * policy can never accidentally schedule onto a node that discovery has
+ * marked dead but not yet evicted.
+ */
 ClusterView ClusterViewManager::snapshot() const {
     std::shared_lock lock(mutex_);
     ClusterView view;
