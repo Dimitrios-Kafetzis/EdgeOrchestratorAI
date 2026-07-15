@@ -7,6 +7,8 @@
  * to provide empirical data for the PhD thesis evaluation.
  *
  * Usage: ./bench_scheduler [--csv]
+ *        ./bench_scheduler --sweep   (policy campaign: topology × DAG size ×
+ *                                     cluster size × policy, CSV to stdout)
  */
 
 #include "core/config.hpp"
@@ -30,8 +32,11 @@
 #include <future>
 #include <iomanip>
 #include <iostream>
+#include <memory>
 #include <numeric>
+#include <random>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 using namespace edge_orchestrator;
@@ -289,8 +294,153 @@ std::vector<BenchResult> bench_transport() {
     return R;
 }
 
+// ─────────────────────────────────────────────
+// Policy Sweep (--sweep)
+//
+// Campaign: topology × DAG size × cluster size × policy.
+// Measures scheduling latency and evaluates each policy's plan under a
+// single dependency-aware makespan model (the same list-scheduling model
+// the optimizer uses internally), so makespan numbers are comparable
+// across policies rather than each policy grading its own homework.
+// ─────────────────────────────────────────────
+
+/**
+ * @brief Dependency-aware makespan of a plan, independent of policy.
+ *
+ * List schedule in topological order: one execution slot per node,
+ * cross-node edges pay output_bytes × comm_weight × 0.001 us — identical
+ * to OptimizerPolicy's internal model.
+ */
+double evaluate_plan_makespan_ms(const WorkloadDAG& dag,
+                                 const SchedulingPlan& plan,
+                                 const ResourceSnapshot& local,
+                                 const ClusterView& cluster,
+                                 float comm_weight = 0.3f) {
+    std::unordered_map<std::string, size_t> node_index;
+    node_index[local.node_id] = 0;
+    size_t next = 1;
+    for (const auto& peer : cluster.peers) node_index[peer.node_id] = next++;
+
+    std::unordered_map<TaskId, size_t> assignment;
+    for (const auto& d : plan.decisions) {
+        auto it = node_index.find(d.assigned_node);
+        if (it != node_index.end()) assignment[d.task_id] = it->second;
+    }
+
+    std::unordered_map<TaskId, int64_t> end_time;
+    std::vector<int64_t> node_free(node_index.size(), 0);
+    int64_t makespan = 0;
+
+    for (const auto& task_id : dag.topological_order()) {
+        auto task = dag.get_task(task_id);
+        if (!task) continue;
+        auto assigned = assignment.find(task_id);
+        if (assigned == assignment.end()) continue;
+        size_t node = assigned->second;
+
+        int64_t ready = 0;
+        for (const auto& dep_id : dag.dependencies(task_id)) {
+            auto dep_end = end_time.find(dep_id);
+            if (dep_end == end_time.end()) continue;
+            int64_t arrival = dep_end->second;
+            auto dep_assigned = assignment.find(dep_id);
+            if (dep_assigned != assignment.end() && dep_assigned->second != node) {
+                auto dep_task = dag.get_task(dep_id);
+                if (dep_task) {
+                    arrival += static_cast<int64_t>(
+                        static_cast<float>(dep_task->profile.output_bytes)
+                        * comm_weight * 0.001f);
+                }
+            }
+            ready = std::max(ready, arrival);
+        }
+
+        int64_t start = std::max(ready, node_free[node]);
+        int64_t end = start + task->profile.compute_cost.count();
+        end_time[task_id] = end;
+        node_free[node] = end;
+        makespan = std::max(makespan, end);
+    }
+
+    return static_cast<double>(makespan) / 1000.0;  // us → ms
+}
+
+WorkloadDAG make_sweep_dag(const std::string& topology, size_t tasks) {
+    TaskProfile pr{.compute_cost = Duration{1000}, .memory_bytes = 4096,
+                   .input_bytes = 64 * 1024, .output_bytes = 64 * 1024};
+    if (topology == "chain") return WorkloadGenerator::linear_chain(tasks, pr);
+    if (topology == "fanout") return WorkloadGenerator::fan_out_fan_in(tasks - 2, pr);
+    if (topology == "transformer")
+        return WorkloadGenerator::transformer_layers(tasks / 2, 768, 2048);
+    // random: fixed seed for reproducibility across runs and machines
+    std::mt19937 rng(12345);
+    TaskProfile lo{.compute_cost = Duration{500}, .memory_bytes = 4096,
+                   .input_bytes = 4 * 1024, .output_bytes = 4 * 1024};
+    TaskProfile hi{.compute_cost = Duration{2000}, .memory_bytes = 1 << 20,
+                   .input_bytes = 64 * 1024, .output_bytes = 64 * 1024};
+    return WorkloadGenerator::random_dag(tasks, 0.1f, lo, hi, rng);
+}
+
+void run_sweep() {
+    auto local = make_snap();
+    std::cout << "topology,tasks,nodes,policy,sched_mean_us,sched_stddev_us,"
+                 "sched_p99_us,sched_min_us,iterations,makespan_ms,local_fraction\n";
+
+    for (const std::string topology : {"chain", "fanout", "random", "transformer"}) {
+        for (size_t tasks : {10u, 50u, 100u, 500u}) {
+            auto dag = make_sweep_dag(topology, tasks);
+            for (size_t nodes : {1u, 3u, 5u}) {
+                auto cluster = make_cluster(nodes - 1);
+                for (const std::string policy_name : {"greedy", "threshold", "optimizer"}) {
+                    auto make_policy = [&]() -> std::unique_ptr<ISchedulingPolicy> {
+                        if (policy_name == "greedy") return std::make_unique<GreedyPolicy>();
+                        if (policy_name == "threshold")
+                            return std::make_unique<ThresholdPolicy>(ThresholdPolicyConfig{});
+                        return std::make_unique<OptimizerPolicy>(OptimizerPolicyConfig{});
+                    };
+
+                    // Fewer reps where a single call is expensive
+                    size_t reps = (policy_name == "optimizer")
+                                      ? (tasks >= 500 ? 30 : 100)
+                                      : (tasks >= 500 ? 100 : 300);
+
+                    auto res = run_bench(policy_name, "Sweep", reps, [&] {
+                        auto p = make_policy();
+                        auto plan = p->schedule(dag, local, cluster);
+                        (void)plan;
+                    });
+
+                    auto plan = make_policy()->schedule(dag, local, cluster);
+                    double makespan_ms =
+                        evaluate_plan_makespan_ms(dag, plan, local, cluster);
+                    size_t local_count = 0;
+                    for (const auto& d : plan.decisions)
+                        if (d.assigned_node == local.node_id) ++local_count;
+                    double local_fraction = plan.decisions.empty()
+                        ? 1.0
+                        : static_cast<double>(local_count)
+                              / static_cast<double>(plan.decisions.size());
+
+                    std::cout << topology << "," << tasks << "," << nodes << ","
+                              << policy_name << "," << std::fixed
+                              << std::setprecision(2) << res.mean_us << ","
+                              << res.stddev_us << "," << res.p99_us << ","
+                              << res.min_us << "," << reps << ","
+                              << std::setprecision(3) << makespan_ms << ","
+                              << local_fraction << "\n";
+                }
+            }
+        }
+    }
+}
+
 int main(int argc, char* argv[]) {
     bool csv = (argc > 1 && std::strcmp(argv[1], "--csv") == 0);
+
+    if (argc > 1 && std::strcmp(argv[1], "--sweep") == 0) {
+        run_sweep();
+        return 0;
+    }
 
     if (!csv) {
         std::cout << "\n  EdgeOrchestrator Performance Benchmarks\n"
